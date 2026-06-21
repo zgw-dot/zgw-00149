@@ -6,7 +6,8 @@ from datetime import datetime, date, timedelta
 from data_manager import (
     DataManager, InstrumentStatus, ReservationStatus, UserRole,
     TimeSlot, STATUS_FLOW, OperationType, ReservationTemplate,
-    ImportResult, BatchRecord, TemplateSnapshot, BatchItemResult
+    ImportResult, BatchRecord, TemplateSnapshot, BatchItemResult,
+    SandboxItemStatus, SandboxDraft, SandboxDraftItem
 )
 
 
@@ -1973,6 +1974,339 @@ class InstrumentDetailDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="关闭", command=self.destroy, width=12).pack()
 
 
+class SandboxDialog(tk.Toplevel):
+    def __init__(self, parent, dm: DataManager):
+        super().__init__(parent)
+        self.dm = dm
+        self.title("预约批量建单沙盘")
+        self.geometry("1100x780")
+        self.minsize(1000, 700)
+        self.transient(parent)
+        self.grab_set()
+        self._build_ui()
+        self._refresh_drafts()
+
+    def _build_ui(self):
+        padding = {"padx": 6, "pady": 4}
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        top_frame = ttk.Frame(frm)
+        top_frame.pack(fill="x", pady=(0, 6))
+
+        ttk.Button(top_frame, text="导入CSV", command=self._import_csv, width=12).pack(side="left", padx=3)
+        ttk.Button(top_frame, text="导入JSON", command=self._import_json, width=12).pack(side="left", padx=3)
+        ttk.Separator(top_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(top_frame, text="删除草稿", command=self._delete_draft, width=10).pack(side="left", padx=3)
+        ttk.Button(top_frame, text="刷新", command=self._refresh_drafts, width=8).pack(side="left", padx=3)
+
+        drafts_lf = ttk.LabelFrame(frm, text="草稿列表", padding=6)
+        drafts_lf.pack(fill="x", pady=(0, 6))
+
+        draft_cols = ("name", "operator", "items", "source", "submitted", "created_at")
+        self.draft_tree = ttk.Treeview(drafts_lf, columns=draft_cols, show="headings", height=5)
+        self.draft_tree.heading("name", text="草稿名称")
+        self.draft_tree.heading("operator", text="操作人")
+        self.draft_tree.heading("items", text="条目数")
+        self.draft_tree.heading("source", text="来源文件")
+        self.draft_tree.heading("submitted", text="提交状态")
+        self.draft_tree.heading("created_at", text="创建时间")
+        self.draft_tree.column("name", width=150, anchor="w")
+        self.draft_tree.column("operator", width=80, anchor="w")
+        self.draft_tree.column("items", width=60, anchor="center")
+        self.draft_tree.column("source", width=150, anchor="w")
+        self.draft_tree.column("submitted", width=80, anchor="center")
+        self.draft_tree.column("created_at", width=140, anchor="w")
+        self.draft_tree.pack(fill="x")
+        self.draft_tree.bind("<<TreeviewSelect>>", self._on_draft_select)
+
+        action_frame = ttk.Frame(frm)
+        action_frame.pack(fill="x", pady=(0, 6))
+        ttk.Button(action_frame, text="预演", command=self._preview, width=10).pack(side="left", padx=3)
+        ttk.Button(action_frame, text="确认提交", command=self._confirm_submit, width=10).pack(side="left", padx=3)
+        ttk.Button(action_frame, text="撤回", command=self._withdraw, width=10).pack(side="left", padx=3)
+        ttk.Separator(action_frame, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(action_frame, text="导出预演结果", command=self._export_preview, width=14).pack(side="left", padx=3)
+        ttk.Button(action_frame, text="导出差异报告", command=self._export_diff, width=14).pack(side="left", padx=3)
+
+        detail_lf = ttk.LabelFrame(frm, text="草稿明细（预演状态 & 原因）", padding=6)
+        detail_lf.pack(fill="both", expand=True, pady=(0, 6))
+
+        detail_cols = ("idx", "instrument", "applicant", "purpose", "start", "end", "status", "reasons")
+        self.detail_tree = ttk.Treeview(detail_lf, columns=detail_cols, show="headings", height=12)
+        self.detail_tree.heading("idx", text="序号")
+        self.detail_tree.heading("instrument", text="仪器编号")
+        self.detail_tree.heading("applicant", text="申请人")
+        self.detail_tree.heading("purpose", text="用途")
+        self.detail_tree.heading("start", text="开始时间")
+        self.detail_tree.heading("end", text="结束时间")
+        self.detail_tree.heading("status", text="预演状态")
+        self.detail_tree.heading("reasons", text="原因")
+        self.detail_tree.column("idx", width=45, anchor="center")
+        self.detail_tree.column("instrument", width=80, anchor="w")
+        self.detail_tree.column("applicant", width=70, anchor="w")
+        self.detail_tree.column("purpose", width=120, anchor="w")
+        self.detail_tree.column("start", width=130, anchor="w")
+        self.detail_tree.column("end", width=130, anchor="w")
+        self.detail_tree.column("status", width=80, anchor="center")
+        self.detail_tree.column("reasons", width=300, anchor="w")
+
+        self.detail_tree.tag_configure("direct", foreground="#2e7d32")
+        self.detail_tree.tag_configure("confirm", foreground="#e65100")
+        self.detail_tree.tag_configure("forbidden", foreground="#c62828")
+        self.detail_tree.tag_configure("none", foreground="#9e9e9e")
+
+        vsb = ttk.Scrollbar(detail_lf, orient="vertical", command=self.detail_tree.yview)
+        self.detail_tree.configure(yscrollcommand=vsb.set)
+        self.detail_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.status_label = ttk.Label(frm, text="", anchor="w")
+        self.status_label.pack(fill="x")
+
+        ttk.Button(frm, text="关闭", command=self.destroy, width=10).pack(anchor="e", pady=(4, 0))
+
+    def _refresh_drafts(self):
+        for item in self.draft_tree.get_children():
+            self.draft_tree.delete(item)
+        drafts = self.dm.list_sandbox_drafts()
+        for d in drafts:
+            sub_text = "已提交" if d.is_submitted else "未提交"
+            self.draft_tree.insert("", "end", iid=d.id, values=(
+                d.name, d.operator, len(d.items),
+                d.source_file, sub_text, d.created_at,
+            ))
+        self._update_permissions()
+        self.status_label.config(text=f"共 {len(drafts)} 份草稿")
+
+    def _update_permissions(self):
+        is_admin = self.dm.settings.current_role == UserRole.ADMIN
+
+    def _get_selected_draft(self):
+        sel = self.draft_tree.selection()
+        if not sel:
+            return None
+        return self.dm.get_sandbox_draft(sel[0])
+
+    def _on_draft_select(self, _=None):
+        draft = self._get_selected_draft()
+        if not draft:
+            return
+        for item in self.detail_tree.get_children():
+            self.detail_tree.delete(item)
+        for it in draft.items:
+            status_display = it.preview_status or "未预演"
+            reasons_str = "; ".join(it.preview_reasons) if it.preview_reasons else ""
+            tag = "direct" if it.preview_status == SandboxItemStatus.DIRECT_SUBMIT.value else \
+                  "confirm" if it.preview_status == SandboxItemStatus.NEEDS_CONFIRM.value else \
+                  "forbidden" if it.preview_status == SandboxItemStatus.FORBIDDEN.value else "none"
+            self.detail_tree.insert("", "end", values=(
+                it.index + 1, it.instrument_code, it.applicant, it.purpose,
+                it.start_time, it.end_time, status_display, reasons_str,
+            ), tags=(tag,))
+        sub_text = "已提交" if draft.is_submitted else "未提交"
+        self.status_label.config(
+            text=f"草稿「{draft.name}」- {len(draft.items)}条 - {sub_text}"
+        )
+
+    def _import_csv(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可执行沙盘导入", parent=self)
+            return
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
+        filepath = filedialog.askopenfilename(
+            title="导入预约明细CSV",
+            initialdir=initial_dir,
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        self._do_import(filepath)
+
+    def _import_json(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可执行沙盘导入", parent=self)
+            return
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
+        filepath = filedialog.askopenfilename(
+            title="导入预约明细JSON",
+            initialdir=initial_dir,
+            filetypes=[("JSON 文件", "*.json")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        self._do_import(filepath)
+
+    def _do_import(self, filepath):
+        draft_name = os.path.splitext(os.path.basename(filepath))[0]
+        draft_name = simpledialog.askstring(
+            "草稿名称", "请输入草稿名称：", initialvalue=draft_name, parent=self
+        )
+        if not draft_name or not draft_name.strip():
+            return
+        draft, errors = self.dm.import_to_sandbox_draft(
+            filepath, draft_name.strip(),
+            self.dm.settings.current_user,
+            self.dm.settings.current_role,
+        )
+        if draft:
+            msg = f"导入成功！\n\n草稿名称：{draft.name}\n有效条目：{len(draft.items)}条"
+            if errors:
+                msg += "\n\n提示信息：\n" + "\n".join(errors[:10])
+            messagebox.showinfo("沙盘导入", msg, parent=self)
+            self._refresh_drafts()
+        else:
+            messagebox.showerror("沙盘导入失败", "\n".join(errors[:15]), parent=self)
+
+    def _delete_draft(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        if not messagebox.askyesno("确认", f"确定要删除草稿「{draft.name}」吗？", parent=self):
+            return
+        ok, msg = self.dm.delete_sandbox_draft(draft.id)
+        if ok:
+            self._refresh_drafts()
+        else:
+            messagebox.showerror("删除失败", msg, parent=self)
+
+    def _preview(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        draft = self.dm.preview_sandbox_draft(draft.id)
+        if not draft:
+            messagebox.showerror("预演失败", "草稿不存在", parent=self)
+            return
+        self._on_draft_select()
+        direct = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.DIRECT_SUBMIT.value)
+        confirm = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.NEEDS_CONFIRM.value)
+        forbidden = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.FORBIDDEN.value)
+        messagebox.showinfo(
+            "预演完成",
+            f"草稿「{draft.name}」预演结果：\n\n"
+            f"可直接提交：{direct}条\n需人工确认：{confirm}条\n禁止提交：{forbidden}条",
+            parent=self,
+        )
+
+    def _confirm_submit(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        if draft.is_submitted:
+            messagebox.showwarning("提示", "该草稿已提交", parent=self)
+            return
+        if not any(it.preview_status for it in draft.items):
+            messagebox.showwarning("提示", "请先执行预演", parent=self)
+            return
+        direct = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.DIRECT_SUBMIT.value)
+        confirm = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.NEEDS_CONFIRM.value)
+        forbidden = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.FORBIDDEN.value)
+        if not messagebox.askyesno(
+            "确认提交",
+            f"将提交草稿「{draft.name}」：\n\n"
+            f"可直接提交：{direct}条（将正式入库）\n"
+            f"需人工确认：{confirm}条（将正式入库，请注意风险）\n"
+            f"禁止提交：{forbidden}条（将被跳过）\n\n是否继续？",
+            parent=self,
+        ):
+            return
+        draft_updated, fail_msgs, batch_id = self.dm.confirm_sandbox_draft(
+            draft.id,
+            self.dm.settings.current_user,
+            self.dm.settings.current_role,
+        )
+        if not draft_updated:
+            messagebox.showerror("提交失败", "\n".join(fail_msgs), parent=self)
+            return
+        self._refresh_drafts()
+        self._on_draft_select()
+        msg = f"提交完成！\n\n成功入库：{len([it for it in draft_updated.items if it.reservation_id])}条\n"
+        if fail_msgs:
+            msg += f"跳过/失败：{len(fail_msgs)}条\n\n" + "\n".join(fail_msgs[:10])
+        messagebox.showinfo("沙盘提交", msg, parent=self)
+
+    def _withdraw(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        if not draft.is_submitted:
+            messagebox.showwarning("提示", "该草稿尚未提交", parent=self)
+            return
+        reason = simpledialog.askstring(
+            "撤回原因", "请输入撤回原因：", parent=self
+        )
+        if not reason or not reason.strip():
+            messagebox.showwarning("提示", "请填写撤回原因", parent=self)
+            return
+        ok, msg = self.dm.sandbox_batch_withdraw(
+            draft.id,
+            self.dm.settings.current_user,
+            self.dm.settings.current_role,
+            reason.strip(),
+        )
+        if ok:
+            messagebox.showinfo("撤回成功", msg, parent=self)
+            self._refresh_drafts()
+            self._on_draft_select()
+        else:
+            messagebox.showerror("撤回失败", msg, parent=self)
+
+    def _export_preview(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        initial_dir = self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出预演结果",
+            initialdir=initial_dir,
+            initialfile=f"沙盘预演_{draft.name}_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_sandbox_preview(draft.id, filepath)
+        if ok:
+            self.dm.settings.export_dir = os.path.dirname(filepath)
+            self.dm.save_settings()
+            messagebox.showinfo("导出成功", f"预演结果已导出到：\n{filepath}", parent=self)
+        else:
+            messagebox.showerror("导出失败", msg, parent=self)
+
+    def _export_diff(self):
+        draft = self._get_selected_draft()
+        if not draft:
+            messagebox.showwarning("提示", "请先选择一份草稿", parent=self)
+            return
+        initial_dir = self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出差异报告",
+            initialdir=initial_dir,
+            initialfile=f"沙盘差异_{draft.name}_{date.today().strftime('%Y%m%d')}.txt",
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_sandbox_diff_report(draft.id, filepath)
+        if ok:
+            self.dm.settings.export_dir = os.path.dirname(filepath)
+            self.dm.save_settings()
+            messagebox.showinfo("导出成功", f"差异报告已导出到：\n{filepath}", parent=self)
+        else:
+            messagebox.showerror("导出失败", msg, parent=self)
+
+
 class App:
     def __init__(self):
         self.dm = DataManager()
@@ -2033,6 +2367,8 @@ class App:
         self.batch_menu = tk.Menu(self.menubar, tearoff=0)
         self.batch_menu.add_command(label="批量创建预约", command=self._show_batch_create)
         self.batch_menu.add_command(label="批量操作记录", command=self._show_batch_management)
+        self.batch_menu.add_separator()
+        self.batch_menu.add_command(label="预约沙盘", command=self._show_sandbox)
         self.menubar.add_cascade(label="批量操作", menu=self.batch_menu)
 
         role_menu = tk.Menu(self.menubar, tearoff=0)
@@ -2771,6 +3107,11 @@ class App:
 
     def _show_batch_management(self):
         dlg = BatchManagementDialog(self.root, self.dm)
+        self.root.wait_window(dlg)
+        self._refresh_reservations()
+
+    def _show_sandbox(self):
+        dlg = SandboxDialog(self.root, self.dm)
         self.root.wait_window(dlg)
         self._refresh_reservations()
 

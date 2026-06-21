@@ -29,6 +29,12 @@ class UserRole(str, Enum):
     NORMAL = "普通用户"
 
 
+class SandboxItemStatus(str, Enum):
+    DIRECT_SUBMIT = "可直接提交"
+    NEEDS_CONFIRM = "需人工确认"
+    FORBIDDEN = "禁止提交"
+
+
 class OperationType(str, Enum):
     BATCH_CREATE = "批量建单"
     BATCH_CANCEL = "批量撤销"
@@ -37,6 +43,11 @@ class OperationType(str, Enum):
     TEMPLATE_CREATE = "模板创建"
     TEMPLATE_UPDATE = "模板更新"
     TEMPLATE_DELETE = "模板删除"
+    SANDBOX_IMPORT = "沙盘导入"
+    SANDBOX_PREVIEW = "沙盘预演"
+    SANDBOX_SUBMIT = "沙盘提交"
+    SANDBOX_WITHDRAW = "沙盘撤回"
+    SANDBOX_EXPORT = "沙盘导出"
 
 
 STATUS_FLOW = {
@@ -318,6 +329,75 @@ class BatchItemResult:
 
 
 @dataclass
+class SandboxDraftItem:
+    index: int
+    instrument_code: str
+    applicant: str
+    purpose: str
+    start_time: str
+    end_time: str
+    preview_status: str = ""
+    preview_reasons: List[str] = field(default_factory=list)
+    reservation_id: str = ""
+    template_snapshot: Optional[Dict[str, Any]] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            index=d.get("index", 0),
+            instrument_code=d.get("instrument_code", ""),
+            applicant=d.get("applicant", ""),
+            purpose=d.get("purpose", ""),
+            start_time=d.get("start_time", ""),
+            end_time=d.get("end_time", ""),
+            preview_status=d.get("preview_status", ""),
+            preview_reasons=d.get("preview_reasons", []),
+            reservation_id=d.get("reservation_id", ""),
+            template_snapshot=d.get("template_snapshot"),
+        )
+
+
+@dataclass
+class SandboxDraft:
+    id: str
+    name: str
+    operator: str
+    operator_role: str
+    items: List[SandboxDraftItem]
+    source_file: str
+    created_at: str
+    updated_at: str
+    is_submitted: bool = False
+    submitted_at: Optional[str] = None
+    submitted_batch_id: Optional[str] = None
+
+    def to_dict(self):
+        d = asdict(self)
+        d["items"] = [it.to_dict() for it in self.items]
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        items = [SandboxDraftItem.from_dict(it) for it in d.get("items", [])]
+        return cls(
+            id=d["id"],
+            name=d["name"],
+            operator=d["operator"],
+            operator_role=d["operator_role"],
+            items=items,
+            source_file=d.get("source_file", ""),
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            is_submitted=d.get("is_submitted", False),
+            submitted_at=d.get("submitted_at"),
+            submitted_batch_id=d.get("submitted_batch_id"),
+        )
+
+
+@dataclass
 class BatchRecord:
     id: str
     operator: str
@@ -446,6 +526,7 @@ class DataManager:
         self.templates_file = os.path.join(self.data_dir, "templates.json")
         self.batch_records_file = os.path.join(self.data_dir, "batch_records.json")
         self.operation_logs_file = os.path.join(self.data_dir, "operation_logs.json")
+        self.sandbox_drafts_file = os.path.join(self.data_dir, "sandbox_drafts.json")
 
         self.instruments: List[Instrument] = []
         self.reservations: List[Reservation] = []
@@ -454,6 +535,7 @@ class DataManager:
         self.templates: List[ReservationTemplate] = []
         self.batch_records: List[BatchRecord] = []
         self.operation_logs: List[OperationLogEntry] = []
+        self.sandbox_drafts: List[SandboxDraft] = []
 
         self.load_all()
 
@@ -465,6 +547,7 @@ class DataManager:
         self.load_templates()
         self.load_batch_records()
         self.load_operation_logs()
+        self.load_sandbox_drafts()
         self._check_calibration_expiry()
 
     # ===== Instrument & Reservation (existing) =====
@@ -1894,6 +1977,594 @@ class DataManager:
         if operation_type:
             results = [l for l in results if l.operation_type == operation_type]
         return results[:limit]
+
+    # ===== Sandbox Draft Module =====
+
+    def load_sandbox_drafts(self):
+        if os.path.exists(self.sandbox_drafts_file):
+            with open(self.sandbox_drafts_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.sandbox_drafts = [SandboxDraft.from_dict(d) for d in data]
+        else:
+            self.sandbox_drafts = []
+
+    def save_sandbox_drafts(self):
+        with open(self.sandbox_drafts_file, "w", encoding="utf-8") as f:
+            json.dump([d.to_dict() for d in self.sandbox_drafts], f, ensure_ascii=False, indent=2)
+
+    def _parse_sandbox_csv(self, filepath: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        rows = []
+        errors = []
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for idx, row in enumerate(reader):
+                    line_num = idx + 2
+                    instrument_code = row.get("仪器编号", "").strip()
+                    applicant = row.get("申请人", "").strip()
+                    purpose = row.get("用途", "").strip()
+                    start_time = row.get("开始时间", "").strip()
+                    end_time = row.get("结束时间", "").strip()
+                    if not instrument_code:
+                        errors.append(f"第{line_num}行：仪器编号为空")
+                        continue
+                    if not applicant:
+                        errors.append(f"第{line_num}行：申请人为空")
+                        continue
+                    if not start_time or not end_time:
+                        errors.append(f"第{line_num}行：时间为空")
+                        continue
+                    try:
+                        datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                        datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        errors.append(f"第{line_num}行：时间格式错误，需YYYY-MM-DD HH:MM:SS")
+                        continue
+                    rows.append({
+                        "instrument_code": instrument_code,
+                        "applicant": applicant,
+                        "purpose": purpose,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    })
+        except Exception as e:
+            errors.append(f"文件读取失败：{str(e)}")
+        return rows, errors
+
+    def _parse_sandbox_json(self, filepath: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+        rows = []
+        errors = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                errors.append("JSON根元素必须是数组")
+                return rows, errors
+            for idx, item in enumerate(data):
+                line_num = idx + 1
+                instrument_code = item.get("instrument_code", "").strip()
+                applicant = item.get("applicant", "").strip()
+                purpose = item.get("purpose", "").strip()
+                start_time = item.get("start_time", "").strip()
+                end_time = item.get("end_time", "").strip()
+                if not instrument_code:
+                    errors.append(f"第{line_num}条：仪器编号为空")
+                    continue
+                if not applicant:
+                    errors.append(f"第{line_num}条：申请人为空")
+                    continue
+                if not start_time or not end_time:
+                    errors.append(f"第{line_num}条：时间为空")
+                    continue
+                try:
+                    datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                    datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    errors.append(f"第{line_num}条：时间格式错误")
+                    continue
+                rows.append({
+                    "instrument_code": instrument_code,
+                    "applicant": applicant,
+                    "purpose": purpose,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                })
+        except Exception as e:
+            errors.append(f"文件读取失败：{str(e)}")
+        return rows, errors
+
+    def _dedup_sandbox_rows(self, rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        seen = set()
+        deduped = []
+        dup_count = 0
+        for r in rows:
+            key = (r["instrument_code"], r["applicant"], r["start_time"], r["end_time"])
+            if key in seen:
+                dup_count += 1
+                continue
+            seen.add(key)
+            deduped.append(r)
+        return deduped, dup_count
+
+    def _compute_item_preview(self, item_dict: Dict[str, Any], existing_times: Dict[str, List[Tuple[str, str]]]) -> Tuple[str, List[str]]:
+        reasons = []
+        instrument_code = item_dict["instrument_code"]
+        applicant = item_dict["applicant"]
+        start_time = item_dict["start_time"]
+        end_time = item_dict["end_time"]
+
+        ins = self.get_instrument_by_code(instrument_code)
+        if not ins:
+            return SandboxItemStatus.FORBIDDEN.value, [f"仪器编号「{instrument_code}」不存在"]
+
+        if ins.status == InstrumentStatus.MALFUNCTION_FROZEN:
+            reasons.append(f"仪器{ins.code}处于故障冻结状态")
+        if ins.status == InstrumentStatus.CALIBRATION_EXPIRED:
+            reasons.append(f"仪器{ins.code}校准已过期")
+
+        try:
+            new_start = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+            new_end = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+            if new_start >= new_end:
+                reasons.append("开始时间必须早于结束时间")
+        except ValueError:
+            reasons.append("时间格式错误")
+            return SandboxItemStatus.FORBIDDEN.value, reasons
+
+        active_statuses = [
+            ReservationStatus.CONFIRMED,
+            ReservationStatus.IN_USE,
+            ReservationStatus.PENDING_REVIEW,
+        ]
+        for r in self.reservations:
+            if r.instrument_id != ins.id:
+                continue
+            if r.status not in active_statuses:
+                continue
+            try:
+                r_start = datetime.strptime(r.start_time, "%Y-%m-%d %H:%M:%S")
+                r_end = datetime.strptime(r.end_time, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if new_start < r_end and new_end > r_start:
+                reasons.append(f"时间冲突：与{r.applicant}的预约重叠({r.start_time}~{r.end_time})")
+                break
+
+        ins_key = ins.id
+        if ins_key in existing_times:
+            for (es, ee) in existing_times[ins_key]:
+                try:
+                    es_dt = datetime.strptime(es, "%Y-%m-%d %H:%M:%S")
+                    ee_dt = datetime.strptime(ee, "%Y-%m-%d %H:%M:%S")
+                    if new_start < ee_dt and new_end > es_dt:
+                        reasons.append(f"批次内时间冲突：与同批次其他项重叠")
+                        break
+                except ValueError:
+                    pass
+
+        for r in self.reservations:
+            if r.applicant == applicant and r.status in active_statuses:
+                try:
+                    r_start = datetime.strptime(r.start_time, "%Y-%m-%d %H:%M:%S")
+                    r_end = datetime.strptime(r.end_time, "%Y-%m-%d %H:%M:%S")
+                    if new_start < r_end and new_end > r_start:
+                        reasons.append(f"重复申请：{applicant}在同一时段已有预约")
+                        break
+                except ValueError:
+                    pass
+
+        is_admin = self.settings.current_role == UserRole.ADMIN
+        if not is_admin:
+            if ins.person_in_charge != applicant:
+                reasons.append(f"权限限制：{applicant}不是仪器{ins.code}的负责人")
+
+        if any("故障冻结" in r for r in reasons) or any("校准已过期" in r for r in reasons):
+            return SandboxItemStatus.FORBIDDEN.value, reasons
+        if any("不存在" in r for r in reasons):
+            return SandboxItemStatus.FORBIDDEN.value, reasons
+        if any("权限限制" in r for r in reasons):
+            return SandboxItemStatus.FORBIDDEN.value, reasons
+
+        if reasons:
+            return SandboxItemStatus.NEEDS_CONFIRM.value, reasons
+
+        return SandboxItemStatus.DIRECT_SUBMIT.value, []
+
+    def import_to_sandbox_draft(self, filepath: str, draft_name: str,
+                                 operator: str, user_role: UserRole) -> Tuple[Optional[SandboxDraft], List[str]]:
+        errors = []
+        if user_role != UserRole.ADMIN:
+            errors.append("仅管理员可执行沙盘导入")
+            return None, errors
+
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == ".csv":
+            rows, parse_errors = self._parse_sandbox_csv(filepath)
+        elif ext == ".json":
+            rows, parse_errors = self._parse_sandbox_json(filepath)
+        else:
+            errors.append(f"不支持的文件格式：{ext}")
+            return None, errors
+
+        errors.extend(parse_errors)
+        if not rows:
+            errors.append("没有可导入的有效数据行")
+            return None, errors
+
+        deduped, dup_count = self._dedup_sandbox_rows(rows)
+        if dup_count > 0:
+            errors.append(f"去重移除了{dup_count}条重复行")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        items = []
+        for i, r in enumerate(deduped):
+            items.append(SandboxDraftItem(
+                index=i,
+                instrument_code=r["instrument_code"],
+                applicant=r["applicant"],
+                purpose=r["purpose"],
+                start_time=r["start_time"],
+                end_time=r["end_time"],
+            ))
+
+        draft = SandboxDraft(
+            id=str(uuid.uuid4()),
+            name=draft_name,
+            operator=operator,
+            operator_role=user_role.value,
+            items=items,
+            source_file=os.path.basename(filepath),
+            created_at=now,
+            updated_at=now,
+        )
+        self.sandbox_drafts.insert(0, draft)
+        self.save_sandbox_drafts()
+
+        self._add_operation_log(
+            operation_type=OperationType.SANDBOX_IMPORT.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"沙盘导入：草稿「{draft_name}」，{len(items)}条记录",
+            detail=f"文件={filepath}，去重{dup_count}条",
+        )
+
+        return draft, errors
+
+    def preview_sandbox_draft(self, draft_id: str) -> Optional[SandboxDraft]:
+        draft = None
+        for d in self.sandbox_drafts:
+            if d.id == draft_id:
+                draft = d
+                break
+        if not draft:
+            return None
+
+        all_times_map: Dict[str, List[Tuple[str, str]]] = {}
+        for item in draft.items:
+            ins = self.get_instrument_by_code(item.instrument_code)
+            if ins:
+                key = ins.id
+                if key not in all_times_map:
+                    all_times_map[key] = []
+                all_times_map[key].append((item.start_time, item.end_time, item.index))
+
+        for item in draft.items:
+            other_times: Dict[str, List[Tuple[str, str]]] = {}
+            ins = self.get_instrument_by_code(item.instrument_code)
+            if ins and ins.id in all_times_map:
+                other_list = [(s, e) for s, e, idx in all_times_map[ins.id] if idx != item.index]
+                if other_list:
+                    other_times[ins.id] = other_list
+
+            saved_role = self.settings.current_role
+            status, reasons = self._compute_item_preview({
+                "instrument_code": item.instrument_code,
+                "applicant": item.applicant,
+                "start_time": item.start_time,
+                "end_time": item.end_time,
+            }, other_times)
+            item.preview_status = status
+            item.preview_reasons = reasons
+
+        draft.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.save_sandbox_drafts()
+
+        self._add_operation_log(
+            operation_type=OperationType.SANDBOX_PREVIEW.value,
+            operator=self.settings.current_user,
+            operator_role=self.settings.current_role.value,
+            description=f"沙盘预演：草稿「{draft.name}」",
+            detail=f"总{len(draft.items)}条",
+        )
+
+        return draft
+
+    def confirm_sandbox_draft(self, draft_id: str, operator: str,
+                               user_role: UserRole) -> Tuple[Optional[SandboxDraft], List[str], Optional[str]]:
+        draft = None
+        for d in self.sandbox_drafts:
+            if d.id == draft_id:
+                draft = d
+                break
+        if not draft:
+            return None, ["草稿不存在"], None
+
+        if draft.is_submitted:
+            return None, ["该草稿已提交"], None
+
+        if user_role != UserRole.ADMIN:
+            return None, ["仅管理员可确认提交沙盘草稿"], None
+
+        if not any(it.preview_status for it in draft.items):
+            draft = self.preview_sandbox_draft(draft_id)
+            if not draft:
+                return None, ["预演失败"], None
+
+        batch_id = str(uuid.uuid4())
+        success_ids = []
+        fail_msgs = []
+        item_results = []
+
+        for item in draft.items:
+            if item.preview_status == SandboxItemStatus.FORBIDDEN.value:
+                item_results.append(BatchItemResult(
+                    index=item.index, status="skipped",
+                    instrument_code=item.instrument_code,
+                    start_time=item.start_time, applicant=item.applicant,
+                    reason="; ".join(item.preview_reasons),
+                ))
+                fail_msgs.append(f"第{item.index+1}项禁止提交：{'；'.join(item.preview_reasons)}")
+                continue
+
+            ins = self.get_instrument_by_code(item.instrument_code)
+            if not ins:
+                item_results.append(BatchItemResult(
+                    index=item.index, status="failed",
+                    instrument_code=item.instrument_code,
+                    applicant=item.applicant, reason="仪器不存在",
+                ))
+                fail_msgs.append(f"第{item.index+1}项：仪器不存在")
+                continue
+
+            res, msg = self.add_reservation(
+                instrument_id=ins.id,
+                applicant=item.applicant,
+                purpose=item.purpose,
+                start_time=item.start_time,
+                end_time=item.end_time,
+                batch_id=batch_id,
+            )
+            if res:
+                item.reservation_id = res.id
+                success_ids.append(res.id)
+                item_results.append(BatchItemResult(
+                    index=item.index, status="success",
+                    instrument_code=item.instrument_code,
+                    start_time=item.start_time, applicant=item.applicant,
+                    reservation_id=res.id,
+                ))
+            else:
+                item_results.append(BatchItemResult(
+                    index=item.index, status="failed",
+                    instrument_code=item.instrument_code,
+                    start_time=item.start_time, applicant=item.applicant,
+                    reason=msg,
+                ))
+                fail_msgs.append(f"第{item.index+1}项：{msg}")
+
+        success_count = len(success_ids)
+        skipped_count = sum(1 for ir in item_results if ir.status == "skipped")
+        failed_count = sum(1 for ir in item_results if ir.status == "failed")
+
+        record = BatchRecord(
+            id=batch_id,
+            operator=operator,
+            operator_role=user_role.value,
+            operation=OperationType.SANDBOX_SUBMIT.value,
+            total_count=len(draft.items),
+            success_count=success_count,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+            reservation_ids=success_ids,
+            item_results=item_results,
+            details="\n".join(fail_msgs) if fail_msgs else "",
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        self.batch_records.insert(0, record)
+        self.save_batch_records()
+
+        draft.is_submitted = True
+        draft.submitted_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        draft.submitted_batch_id = batch_id
+        draft.updated_at = draft.submitted_at
+        self.save_sandbox_drafts()
+
+        self._add_operation_log(
+            operation_type=OperationType.SANDBOX_SUBMIT.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"沙盘提交：草稿「{draft.name}」，成功{success_count}，跳过{skipped_count}，失败{failed_count}",
+            detail=f"批次ID={batch_id}",
+        )
+
+        return draft, fail_msgs, batch_id
+
+    def sandbox_batch_withdraw(self, draft_id: str, operator: str,
+                                user_role: UserRole, reason: str) -> Tuple[bool, str]:
+        if user_role != UserRole.ADMIN:
+            return False, "仅管理员可执行沙盘撤回"
+
+        draft = None
+        for d in self.sandbox_drafts:
+            if d.id == draft_id:
+                draft = d
+                break
+        if not draft:
+            return False, "草稿不存在"
+
+        if not draft.is_submitted or not draft.submitted_batch_id:
+            return False, "该草稿尚未提交，无需撤回"
+
+        batch = self.get_batch_record(draft.submitted_batch_id)
+        if not batch:
+            return False, "关联的批次记录不存在"
+
+        if batch.is_cancelled:
+            return False, "该批次已被撤回"
+
+        cancelled_count = 0
+        for rid in batch.reservation_ids:
+            res = None
+            for r in self.reservations:
+                if r.id == rid:
+                    res = r
+                    break
+            if not res:
+                continue
+            if res.status in [ReservationStatus.CANCELLED, ReservationStatus.COMPLETED]:
+                continue
+            res.status = ReservationStatus.CANCELLED
+            res.cancel_reason = f"沙盘撤回：{reason}"
+            res.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cancelled_count += 1
+
+        batch.is_cancelled = True
+        batch.cancel_operator = operator
+        batch.cancel_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        batch.cancel_reason = reason
+        self.save_batch_records()
+        self.save_reservations()
+
+        draft.is_submitted = False
+        draft.submitted_at = None
+        draft.submitted_batch_id = None
+        draft.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for item in draft.items:
+            item.reservation_id = ""
+        self.save_sandbox_drafts()
+
+        self._add_operation_log(
+            operation_type=OperationType.SANDBOX_WITHDRAW.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"沙盘撤回：草稿「{draft.name}」，实际撤销{cancelled_count}个预约",
+            detail=f"原因={reason}",
+        )
+
+        return True, f"成功撤回 {cancelled_count} 个预约"
+
+    def get_sandbox_draft(self, draft_id: str) -> Optional[SandboxDraft]:
+        for d in self.sandbox_drafts:
+            if d.id == draft_id:
+                return d
+        return None
+
+    def list_sandbox_drafts(self) -> List[SandboxDraft]:
+        results = self.sandbox_drafts.copy()
+        results.sort(key=lambda d: d.created_at, reverse=True)
+        return results
+
+    def delete_sandbox_draft(self, draft_id: str) -> Tuple[bool, str]:
+        idx = -1
+        name = ""
+        for i, d in enumerate(self.sandbox_drafts):
+            if d.id == draft_id:
+                idx = i
+                name = d.name
+                break
+        if idx < 0:
+            return False, "草稿不存在"
+        if self.sandbox_drafts[idx].is_submitted:
+            return False, "已提交的草稿不能删除，请先撤回"
+        del self.sandbox_drafts[idx]
+        self.save_sandbox_drafts()
+        return True, ""
+
+    def export_sandbox_preview(self, draft_id: str, filepath: str) -> Tuple[bool, str]:
+        draft = self.get_sandbox_draft(draft_id)
+        if not draft:
+            return False, "草稿不存在"
+        try:
+            with open(filepath, "w", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "序号", "仪器编号", "申请人", "用途",
+                    "开始时间", "结束时间", "预演状态", "原因"
+                ])
+                for item in draft.items:
+                    reasons_str = "; ".join(item.preview_reasons) if item.preview_reasons else ""
+                    writer.writerow([
+                        item.index + 1,
+                        item.instrument_code,
+                        item.applicant,
+                        item.purpose,
+                        item.start_time,
+                        item.end_time,
+                        item.preview_status or "未预演",
+                        reasons_str,
+                    ])
+            self._add_operation_log(
+                operation_type=OperationType.SANDBOX_EXPORT.value,
+                operator=self.settings.current_user,
+                operator_role=self.settings.current_role.value,
+                description=f"沙盘导出预演结果：草稿「{draft.name}」",
+                detail=f"文件={filepath}",
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def export_sandbox_diff_report(self, draft_id: str, filepath: str) -> Tuple[bool, str]:
+        draft = self.get_sandbox_draft(draft_id)
+        if not draft:
+            return False, "草稿不存在"
+        try:
+            direct_count = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.DIRECT_SUBMIT.value)
+            confirm_count = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.NEEDS_CONFIRM.value)
+            forbidden_count = sum(1 for it in draft.items if it.preview_status == SandboxItemStatus.FORBIDDEN.value)
+            not_previewed = sum(1 for it in draft.items if not it.preview_status)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(f"沙盘差异报告 - 草稿「{draft.name}」\n")
+                f.write(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"操作人：{draft.operator}({draft.operator_role})\n")
+                f.write(f"来源文件：{draft.source_file}\n")
+                f.write(f"创建时间：{draft.created_at}\n\n")
+                f.write(f"=== 统计概览 ===\n")
+                f.write(f"总条目数：{len(draft.items)}\n")
+                f.write(f"可直接提交：{direct_count}\n")
+                f.write(f"需人工确认：{confirm_count}\n")
+                f.write(f"禁止提交：{forbidden_count}\n")
+                f.write(f"未预演：{not_previewed}\n\n")
+                f.write(f"=== 明细 ===\n")
+                for item in draft.items:
+                    f.write(f"\n第{item.index+1}条：\n")
+                    f.write(f"  仪器：{item.instrument_code}\n")
+                    f.write(f"  申请人：{item.applicant}\n")
+                    f.write(f"  用途：{item.purpose}\n")
+                    f.write(f"  时间：{item.start_time} ~ {item.end_time}\n")
+                    f.write(f"  预演状态：{item.preview_status or '未预演'}\n")
+                    if item.preview_reasons:
+                        for r in item.preview_reasons:
+                            f.write(f"    - {r}\n")
+                    if item.reservation_id:
+                        f.write(f"  已入库预约ID：{item.reservation_id}\n")
+                if draft.is_submitted:
+                    f.write(f"\n=== 提交记录 ===\n")
+                    f.write(f"提交时间：{draft.submitted_at}\n")
+                    f.write(f"关联批次ID：{draft.submitted_batch_id}\n")
+
+            self._add_operation_log(
+                operation_type=OperationType.SANDBOX_EXPORT.value,
+                operator=self.settings.current_user,
+                operator_role=self.settings.current_role.value,
+                description=f"沙盘导出差异报告：草稿「{draft.name}」",
+                detail=f"文件={filepath}",
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
 
     # ===== Sample Data =====
 
