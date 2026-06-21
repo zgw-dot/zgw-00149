@@ -138,6 +138,8 @@ class AppSettings:
     export_dir: str = ""
     filter_person: str = ""
     filter_status: str = ""
+    ins_filter_person: str = ""
+    ins_filter_status: str = ""
     current_user: str = "当前用户"
     current_role: UserRole = UserRole.NORMAL
 
@@ -152,6 +154,8 @@ class AppSettings:
             export_dir=d.get("export_dir", ""),
             filter_person=d.get("filter_person", ""),
             filter_status=d.get("filter_status", ""),
+            ins_filter_person=d.get("ins_filter_person", ""),
+            ins_filter_status=d.get("ins_filter_status", ""),
             current_user=d.get("current_user", "当前用户"),
             current_role=UserRole(d.get("current_role", UserRole.NORMAL.value)),
         )

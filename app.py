@@ -276,6 +276,131 @@ class FreezeDialog(tk.Toplevel):
         self.destroy()
 
 
+class CalibrationRecordsDialog(tk.Toplevel):
+    def __init__(self, parent, dm: DataManager):
+        super().__init__(parent)
+        self.dm = dm
+        self.title("校准/冻结记录")
+        self.geometry("780x500")
+        self.minsize(640, 400)
+        self.transient(parent)
+        self.grab_set()
+
+        self._build_ui()
+
+    def _build_ui(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        filter_frame = ttk.LabelFrame(frm, text="筛选", padding=8)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(filter_frame, text="仪器：").grid(row=0, column=0, padx=(0, 5))
+        self.code_filter_var = tk.StringVar()
+        self.code_combo = ttk.Combobox(
+            filter_frame, textvariable=self.code_filter_var, state="readonly", width=20
+        )
+        codes = [""] + sorted({r.get("instrument_code", "") for r in self.dm.calibration_records if r.get("instrument_code")})
+        self.code_combo["values"] = codes
+        self.code_combo.grid(row=0, column=1)
+        self.code_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh())
+
+        ttk.Label(filter_frame, text="操作类型：").grid(row=0, column=2, padx=(15, 5))
+        self.action_filter_var = tk.StringVar()
+        self.action_combo = ttk.Combobox(
+            filter_frame, textvariable=self.action_filter_var, state="readonly", width=12
+        )
+        actions = [""] + sorted({r.get("action", "") for r in self.dm.calibration_records if r.get("action")})
+        self.action_combo["values"] = actions
+        self.action_combo.grid(row=0, column=3)
+        self.action_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh())
+
+        ttk.Button(filter_frame, text="清除筛选", command=self._clear_filter, width=10).grid(
+            row=0, column=4, padx=(15, 0)
+        )
+
+        columns = ("time", "instrument_code", "action", "role", "operator", "reason")
+        self.tree = ttk.Treeview(frm, columns=columns, show="headings")
+        self.tree.heading("time", text="时间")
+        self.tree.heading("instrument_code", text="仪器编号")
+        self.tree.heading("action", text="记录类型")
+        self.tree.heading("role", text="角色")
+        self.tree.heading("operator", text="操作人")
+        self.tree.heading("reason", text="原因/内容")
+
+        self.tree.column("time", width=150, anchor="w")
+        self.tree.column("instrument_code", width=90, anchor="w")
+        self.tree.column("action", width=90, anchor="w")
+        self.tree.column("role", width=70, anchor="w")
+        self.tree.column("operator", width=90, anchor="w")
+        self.tree.column("reason", width=250, anchor="w")
+
+        vsb = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.tree.tag_configure("freeze", foreground="#c62828")
+        self.tree.tag_configure("unfreeze", foreground="#2e7d32")
+        self.tree.tag_configure("calibration", foreground="#1565c0")
+
+        btn_frame = ttk.Frame(frm)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(btn_frame, text=f"共 {len(self.dm.calibration_records)} 条记录").pack(side="left")
+        ttk.Button(btn_frame, text="关闭", command=self.destroy, width=12).pack(side="right")
+
+        self._refresh()
+
+    def _clear_filter(self):
+        self.code_filter_var.set("")
+        self.action_filter_var.set("")
+        self._refresh()
+
+    def _refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        code_filter = self.code_filter_var.get()
+        action_filter = self.action_filter_var.get()
+
+        records = sorted(
+            self.dm.calibration_records,
+            key=lambda r: r.get("time", ""),
+            reverse=True,
+        )
+        for r in records:
+            if code_filter and r.get("instrument_code") != code_filter:
+                continue
+            if action_filter and r.get("action") != action_filter:
+                continue
+
+            action = r.get("action", "")
+            if "冻结" in action and "解除" not in action:
+                tag = "freeze"
+            elif "解除" in action:
+                tag = "unfreeze"
+            else:
+                tag = "calibration"
+
+            reason = r.get("reason") or r.get("result") or ""
+            if r.get("calibration_date"):
+                reason = f"校准日期:{r['calibration_date']} {reason}".strip()
+
+            self.tree.insert(
+                "", "end",
+                values=(
+                    r.get("time", r.get("recorded_at", "")),
+                    r.get("instrument_code", ""),
+                    action,
+                    r.get("role", ""),
+                    r.get("operator", ""),
+                    reason,
+                ),
+                tags=(tag,),
+            )
+
+
 class InstrumentDetailDialog(tk.Toplevel):
     def __init__(self, parent, dm: DataManager, instrument):
         super().__init__(parent)
@@ -377,6 +502,8 @@ class App:
         file_menu.add_command(label="导出预约 (JSON)", command=lambda: self._export("json"))
         file_menu.add_command(label="导出仪器档案 (CSV)", command=self._export_instruments)
         file_menu.add_separator()
+        file_menu.add_command(label="查看校准/冻结记录", command=self._show_calibration_records)
+        file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
         menubar.add_cascade(label="文件", menu=file_menu)
 
@@ -475,6 +602,7 @@ class App:
 
         ttk.Button(action_frame, text="故障冻结", command=self._freeze_instrument).pack(side="left", padx=3)
         ttk.Button(action_frame, text="解除冻结", command=self._unfreeze_instrument).pack(side="left", padx=3)
+        ttk.Button(action_frame, text="校准记录", command=self._show_calibration_records).pack(side="left", padx=3)
         ttk.Button(action_frame, text="刷新", command=self._refresh_instruments).pack(side="right", padx=3)
 
     def _build_reservations_panel(self, parent):
@@ -673,6 +801,9 @@ class App:
                 btn.config(state="disabled")
 
     def _on_filter_change(self):
+        self.dm.settings.ins_filter_person = self.person_filter_var.get()
+        self.dm.settings.ins_filter_status = self.status_filter_var.get()
+        self.dm.save_settings()
         self._refresh_instruments()
 
     def _on_res_filter_change(self):
@@ -682,6 +813,10 @@ class App:
         self._refresh_reservations()
 
     def _load_settings(self):
+        if self.dm.settings.ins_filter_person:
+            self.person_filter_var.set(self.dm.settings.ins_filter_person)
+        if self.dm.settings.ins_filter_status:
+            self.status_filter_var.set(self.dm.settings.ins_filter_status)
         if self.dm.settings.filter_person:
             self.res_person_filter_var.set(self.dm.settings.filter_person)
         if self.dm.settings.filter_status:
@@ -761,6 +896,9 @@ class App:
             messagebox.showwarning("提示", "请选择仪器", parent=self.root)
             return
         InstrumentDetailDialog(self.root, self.dm, ins)
+
+    def _show_calibration_records(self):
+        CalibrationRecordsDialog(self.root, self.dm)
 
     def _freeze_instrument(self):
         ins = self._get_selected_instrument()

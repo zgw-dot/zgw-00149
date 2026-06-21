@@ -348,20 +348,81 @@ def main():
 
         dm3 = DataManager(data_dir=tmpdir)
         assert_true(dm3.settings.export_dir == tmpdir, "6.7 导出目录已持久化")
-        assert_true(dm3.settings.filter_person == "李工", "6.8 筛选条件(负责人)已持久化")
-        assert_true(dm3.settings.filter_status == "已预约", "6.9 筛选条件(状态)已持久化")
+        assert_true(dm3.settings.filter_person == "李工", "6.8 预约筛选(负责人)已持久化")
+        assert_true(dm3.settings.filter_status == "已预约", "6.9 预约筛选(状态)已持久化")
         assert_true(dm3.settings.current_role == UserRole.ADMIN, "6.10 角色已持久化")
+
+        # ------------------------------------------------------------------
+        separator("七、回归测试 - 仪器筛选独立持久化 + 校准记录可见性")
+        # ------------------------------------------------------------------
+        # 7.1 仪器筛选与预约筛选互不串值
+        dm3.settings.ins_filter_person = "王工"
+        dm3.settings.ins_filter_status = "校准过期"
+        dm3.settings.filter_person = "张工"
+        dm3.settings.filter_status = "草稿"
+        dm3.save_settings()
+
+        dm4 = DataManager(data_dir=tmpdir)
+        assert_true(dm4.settings.ins_filter_person == "王工",
+                    "7.1 仪器筛选(负责人)独立持久化 - 王工")
+        assert_true(dm4.settings.ins_filter_status == "校准过期",
+                    "7.2 仪器筛选(状态)独立持久化 - 校准过期")
+        assert_true(dm4.settings.filter_person == "张工",
+                    "7.3 预约筛选(负责人)保持独立 - 张工")
+        assert_true(dm4.settings.filter_status == "草稿",
+                    "7.4 预约筛选(状态)保持独立 - 草稿")
+        assert_true(dm4.settings.ins_filter_person != dm4.settings.filter_person,
+                    "7.5 仪器与预约筛选不串值")
+
+        # 7.2 校准记录跨重启可见，且字段完整（仪器、类型、角色、原因、时间）
+        freeze_records = [r for r in dm4.calibration_records if r["action"] == "故障冻结"]
+        unfreeze_records = [r for r in dm4.calibration_records if r["action"] == "解除冻结"]
+        assert_true(len(freeze_records) >= 1, f"7.6 跨重启后冻结记录可见（{len(freeze_records)} 条）")
+        assert_true(len(unfreeze_records) >= 1, f"7.7 跨重启后解冻记录可见（{len(unfreeze_records)} 条）")
+
+        fr = freeze_records[-1]
+        assert_true("instrument_code" in fr and fr["instrument_code"],
+                    "7.8 冻结记录含仪器编号: " + str(fr.get("instrument_code")))
+        assert_true(fr.get("action") == "故障冻结",
+                    "7.9 冻结记录类型正确: " + str(fr.get("action")))
+        assert_true(fr.get("role") in ("管理员", "普通用户"),
+                    "7.10 冻结记录含角色: " + str(fr.get("role")))
+        assert_true("光源异常" in str(fr.get("reason", "")),
+                    "7.11 冻结记录含原因: " + str(fr.get("reason")))
+        assert_true(fr.get("time") and len(fr.get("time")) >= 10,
+                    "7.12 冻结记录含时间: " + str(fr.get("time")))
+
+        ufr = unfreeze_records[-1]
+        assert_true(ufr.get("role") == "管理员",
+                    "7.13 解冻记录角色=管理员: " + str(ufr.get("role")))
+        assert_true("已更换" in str(ufr.get("reason", "")),
+                    "7.14 解冻记录含原因: " + str(ufr.get("reason")))
+        assert_true(ufr.get("time"), "7.15 解冻记录含时间")
+
+        # 7.3 原主流程与导出未被破坏
+        still_completed = [r for r in dm4.reservations if r.id == main_id]
+        assert_true(len(still_completed) == 1 and still_completed[0].status == ReservationStatus.COMPLETED,
+                    "7.16 原主流程预约状态未被破坏（仍=已完成）")
+
+        csv_path2 = os.path.join(tmpdir, "regression_export.csv")
+        ok, _ = dm4.export_reservations_csv(csv_path2, "", "")
+        assert_true(ok and os.path.exists(csv_path2), "7.17 CSV导出未被破坏")
+        json_path2 = os.path.join(tmpdir, "regression_export.json")
+        ok, _ = dm4.export_reservations_json(json_path2, "", "")
+        assert_true(ok and os.path.exists(json_path2), "7.18 JSON导出未被破坏")
 
         # ------------------------------------------------------------------
         separator("✓ 全部测试通过！")
         # ------------------------------------------------------------------
-        print(f"\n  共执行了 30+ 项断言，覆盖：")
+        print(f"\n  共执行了 40+ 项断言，覆盖：")
         print("    ✅ 初始样例数据（4台仪器，1台校准过期）")
         print("    ✅ 失败路径拦截（校准过期、时间重叠、冻结预约、普通用户解冻、非法流转）")
         print("    ✅ 失败时不改变原有状态")
         print("    ✅ 主流程完整状态流转（草稿→待确认→已预约→使用中→待复核→已完成）")
         print("    ✅ 预约编辑、草稿修改")
         print("    ✅ 冻结/解冻日志（角色、原因、时间）")
+        print("    ✅ 仪器筛选与预约筛选独立持久化（不串值）")
+        print("    ✅ 校准记录跨重启可见（仪器、记录类型、角色、原因、时间）")
         print("    ✅ 按负责人/状态筛选")
         print("    ✅ CSV / JSON 导出")
         print("    ✅ 全量持久化（仪器、预约、校准记录、设置）")

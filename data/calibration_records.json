@@ -1,0 +1,22 @@
+[
+  {
+    "id": "75bfcf0d-061f-4f27-8dc0-5f087c2ae6e4",
+    "instrument_id": "41e397eb-d711-46aa-8711-07c40e1a6ad4",
+    "instrument_code": "INS-002",
+    "action": "故障冻结",
+    "operator": "张工",
+    "role": "管理员",
+    "reason": "手动测试用 - 光源不稳定，请更换",
+    "time": "2026-06-21 09:57:46"
+  },
+  {
+    "id": "b9469346-b742-426c-b06a-74de4bfe95a7",
+    "instrument_id": "41e397eb-d711-46aa-8711-07c40e1a6ad4",
+    "instrument_code": "INS-002",
+    "action": "解除冻结",
+    "operator": "李工",
+    "role": "管理员",
+    "reason": "光源已更换完成，测试通过",
+    "time": "2026-06-21 09:57:46"
+  }
+]

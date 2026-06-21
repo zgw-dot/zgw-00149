@@ -1,7 +1,9 @@
 {
-  "export_dir": "",
-  "filter_person": "",
-  "filter_status": "",
+  "export_dir": "D:\\workSpace\\AI__SPACE\\02-label\\zgw-00149\\data",
+  "filter_person": "李工",
+  "filter_status": "草稿",
+  "ins_filter_person": "张工",
+  "ins_filter_status": "正常",
   "current_user": "当前用户",
   "current_role": "普通用户"
 }
