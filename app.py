@@ -9,7 +9,10 @@ from data_manager import (
     TimeSlot, STATUS_FLOW, OperationType, ReservationTemplate,
     ImportResult, BatchRecord, TemplateSnapshot, BatchItemResult,
     SandboxItemStatus, SandboxDraft, SandboxDraftItem,
-    STANDARD_COLUMNS, ImportMappingScheme, PrecheckResult, PrecheckIssue
+    STANDARD_COLUMNS, ImportMappingScheme, PrecheckResult, PrecheckIssue,
+    ImportValidationRule, ImportValidationScheme, ValidationSnapshot, ValidationBatch,
+    BATCH_DISPOSITION_MAPPING, BATCH_DISPOSITION_DRAFT, BATCH_DISPOSITION_REJECT, BATCH_DISPOSITION_PENDING,
+    VALIDATION_RULE_DEFAULTS
 )
 
 
@@ -2375,6 +2378,10 @@ class App:
         self.menu_import_mapping = self.batch_menu.add_command(
             label="预约导入映射中心", command=self._show_import_mapping_center
         )
+        self.batch_menu.add_separator()
+        self.menu_validation_workbench = self.batch_menu.add_command(
+            label="导入体检工作台", command=self._show_validation_workbench
+        )
         self.menubar.add_cascade(label="批量操作", menu=self.batch_menu)
 
         role_menu = tk.Menu(self.menubar, tearoff=0)
@@ -3137,6 +3144,11 @@ class App:
         self.root.wait_window(dlg)
         self._refresh_reservations()
 
+    def _show_validation_workbench(self):
+        dlg = ImportValidationWorkbenchDialog(self.root, self.dm)
+        self.root.wait_window(dlg)
+        self._refresh_reservations()
+
     def _show_operation_logs(self):
         dlg = OperationLogsDialog(self.root, self.dm)
         self.root.wait_window(dlg)
@@ -3888,6 +3900,687 @@ class ImportMappingCenterDialog(tk.Toplevel):
             self._display_precheck_result(last_precheck)
             self.nb.select(self.tab2)
             self.nb.select(self.tab3)
+
+
+class ImportValidationWorkbenchDialog(tk.Toplevel):
+    def __init__(self, parent, dm: DataManager):
+        super().__init__(parent)
+        self.dm = dm
+        self.title("导入体检工作台")
+        self.geometry("1180x820")
+        self.minsize(1080, 720)
+        self.transient(parent)
+        self.grab_set()
+
+        self.file_path = ""
+        self.file_encoding_var = tk.StringVar(value="auto")
+        self.current_mapping_scheme: Optional[ImportMappingScheme] = None
+        self.current_validation_scheme: Optional[ImportValidationScheme] = None
+        self.current_batch: Optional[ValidationBatch] = None
+        self._all_mapping_schemes: List[ImportMappingScheme] = []
+        self._active_mapping_schemes: List[ImportMappingScheme] = []
+        self._all_validation_schemes: List[ImportValidationScheme] = []
+        self._active_validation_schemes: List[ImportValidationScheme] = []
+        self._rule_vars: Dict[str, tk.BooleanVar] = {}
+
+        self._build_ui()
+        self._refresh_mapping_scheme_list()
+        self._refresh_validation_scheme_list()
+        self._refresh_batch_list()
+        self._restore_session()
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tab1 = ttk.Frame(nb, padding=10)
+        self.tab2 = ttk.Frame(nb, padding=10)
+        self.tab3 = ttk.Frame(nb, padding=10)
+        nb.add(self.tab1, text="1. 文件 & 方案")
+        nb.add(self.tab2, text="2. 体检执行 & 去向")
+        nb.add(self.tab3, text="3. 批次管理 & 快照")
+        self.nb = nb
+
+        self._build_tab1()
+        self._build_tab2()
+        self._build_tab3()
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(bottom, text="※ 管理员可维护体检方案、撤销批次、恢复快照；普通用户仅可见自己的批次",
+                  foreground="#666").pack(side="left")
+        ttk.Button(bottom, text="关闭", command=self.destroy, width=12).pack(side="right")
+
+    def _build_tab1(self):
+        padding = {"padx": 8, "pady": 5}
+
+        file_frame = ttk.LabelFrame(self.tab1, text="步骤1：选择导入文件（支持 UTF-8 / GBK 编码切换）", padding=10)
+        file_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(file_frame, text="文件路径：").grid(row=0, column=0, sticky="e", **padding)
+        self.file_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_var, width=65).grid(row=0, column=1, **padding)
+        ttk.Button(file_frame, text="浏览...", command=self._select_file, width=10).grid(row=0, column=2, **padding)
+
+        ttk.Label(file_frame, text="文件编码：").grid(row=1, column=0, sticky="e", **padding)
+        self.encoding_combo = ttk.Combobox(
+            file_frame, textvariable=self.file_encoding_var,
+            values=["auto", "utf-8-sig", "utf-8", "gbk"],
+            state="readonly", width=15
+        )
+        self.encoding_combo.grid(row=1, column=1, sticky="w", **padding)
+        ttk.Label(file_frame, text="auto=自动探测（推荐 utf-8-sig → utf-8 → gbk 回退）",
+                  foreground="#888").grid(row=1, column=2, sticky="w", **padding)
+
+        self.file_info_label = ttk.Label(file_frame, text="尚未选择文件", foreground="#888")
+        self.file_info_label.grid(row=2, column=0, columnspan=4, sticky="w", padx=8)
+
+        mapping_frame = ttk.LabelFrame(self.tab1, text="步骤2：选择列映射方案", padding=10)
+        mapping_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(mapping_frame, text="映射方案：").pack(side="left", padx=(0, 8))
+        self.mapping_scheme_var = tk.StringVar()
+        self.mapping_scheme_combo = ttk.Combobox(
+            mapping_frame, textvariable=self.mapping_scheme_var, state="readonly", width=45
+        )
+        self.mapping_scheme_combo.pack(side="left", padx=(0, 8))
+        self.mapping_scheme_combo.bind("<<ComboboxSelected>>", self._on_mapping_scheme_select)
+
+        validation_frame = ttk.LabelFrame(self.tab1, text="步骤3：选择 / 管理体检方案（8 类规则可开关）", padding=10)
+        validation_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        top_row = ttk.Frame(validation_frame)
+        top_row.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(top_row, text="体检方案：").pack(side="left", padx=(0, 8))
+        self.validation_scheme_var = tk.StringVar()
+        self.validation_scheme_combo = ttk.Combobox(
+            top_row, textvariable=self.validation_scheme_var, state="readonly", width=40
+        )
+        self.validation_scheme_combo.pack(side="left", padx=(0, 8))
+        self.validation_scheme_combo.bind("<<ComboboxSelected>>", self._on_validation_scheme_select)
+
+        ttk.Button(top_row, text="加载方案", command=self._load_selected_validation_scheme, width=10).pack(side="left", padx=3)
+        self.btn_save_vscheme = ttk.Button(top_row, text="存为新方案", command=self._save_as_new_validation_scheme, width=12)
+        self.btn_save_vscheme.pack(side="left", padx=3)
+        self.btn_update_vscheme = ttk.Button(top_row, text="更新当前方案", command=self._update_current_validation_scheme, width=14)
+        self.btn_update_vscheme.pack(side="left", padx=3)
+        self.btn_delete_vscheme = ttk.Button(top_row, text="删除方案", command=self._delete_selected_validation_scheme, width=10)
+        self.btn_delete_vscheme.pack(side="left", padx=3)
+
+        rules_frame = ttk.LabelFrame(validation_frame, text="体检规则（勾选=启用）", padding=8)
+        rules_frame.pack(fill="both", expand=True)
+
+        self.rules_canvas = tk.Canvas(rules_frame, height=180)
+        rules_scroll = ttk.Scrollbar(rules_frame, orient="vertical", command=self.rules_canvas.yview)
+        self.rules_inner = ttk.Frame(self.rules_canvas)
+        self.rules_inner.bind("<Configure>", lambda e: self.rules_canvas.configure(scrollregion=self.rules_canvas.bbox("all")))
+        self.rules_canvas.create_window((0, 0), window=self.rules_inner, anchor="nw")
+        self.rules_canvas.configure(yscrollcommand=rules_scroll.set)
+        self.rules_canvas.pack(side="left", fill="both", expand=True)
+        rules_scroll.pack(side="right", fill="y")
+
+        for i, (rule_key, rule_desc, _) in enumerate(VALIDATION_RULE_DEFAULTS):
+            var = tk.BooleanVar(value=True)
+            self._rule_vars[rule_key] = var
+            ttk.Checkbutton(self.rules_inner, text=f"{rule_key}  —  {rule_desc}", variable=var).grid(
+                row=i // 2, column=i % 2, sticky="w", padx=10, pady=3
+            )
+
+        tip = ttk.Label(self.tab1,
+                        text="使用流程：选择文件 → 选择编码 → 选择映射方案 → 选择/配置体检规则 → 切到Tab2运行体检",
+                        foreground="#1565c0", font=("Arial", 10, "bold"))
+        tip.pack(fill="x", pady=(0, 8))
+
+    def _build_tab2(self):
+        padding = {"padx": 8, "pady": 5}
+
+        action_frame = ttk.LabelFrame(self.tab2, text="体检操作", padding=10)
+        action_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Button(action_frame, text="▶ 运行体检", command=self._run_validation, width=14).grid(row=0, column=0, **padding)
+        ttk.Button(action_frame, text="导出失败行", command=self._export_failed_rows, width=14).grid(row=0, column=1, **padding)
+        ttk.Button(action_frame, text="导出通过行", command=self._export_passed_rows, width=14).grid(row=0, column=2, **padding)
+        ttk.Label(action_frame, text="→ 体检完成后选择去向：送去映射中心 / 存草稿 / 退回",
+                  foreground="#c62828").grid(row=0, column=3, sticky="w", **padding)
+
+        self.validation_summary = ttk.Label(action_frame, text="尚未运行体检", foreground="#888", font=("Arial", 10, "bold"))
+        self.validation_summary.grid(row=1, column=0, columnspan=4, sticky="w", padx=8)
+
+        issue_frame = ttk.LabelFrame(self.tab2, text="体检问题明细（逐条列出，不同类型用颜色区分）", padding=10)
+        issue_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        issue_cols = ("row", "type", "col", "detail")
+        self.issue_tree = ttk.Treeview(issue_frame, columns=issue_cols, show="headings", height=12)
+        for c, t, w in [
+            ("row", "行号", 60), ("type", "问题类型", 110),
+            ("col", "关联列", 110), ("detail", "详细说明", 800),
+        ]:
+            self.issue_tree.heading(c, text=t)
+            self.issue_tree.column(c, width=w, anchor="w" if c != "row" else "center")
+        vsb2 = ttk.Scrollbar(issue_frame, orient="vertical", command=self.issue_tree.yview)
+        self.issue_tree.configure(yscrollcommand=vsb2.set)
+        self.issue_tree.pack(side="left", fill="both", expand=True)
+        vsb2.pack(side="right", fill="y")
+
+        for tag, color in [
+            ("缺少必填列", "#ffebee"), ("缺列", "#ffebee"),
+            ("空值", "#fff3e0"), ("时间格式错", "#fffde7"),
+            ("时间逻辑错", "#fce4ec"), ("重复行", "#e8f5e9"),
+            ("仪器撞时段", "#f3e5f5"), ("申请人撞单", "#e3f2fd"),
+            ("仪器不存在", "#ffe0b2"),
+        ]:
+            self.issue_tree.tag_configure(tag, background=color)
+
+        disp_frame = ttk.LabelFrame(self.tab2, text="批次去向（体检完成后选择）", padding=10)
+        disp_frame.pack(fill="x")
+
+        self.disposition_var = tk.StringVar(value=BATCH_DISPOSITION_PENDING)
+        ttk.Radiobutton(disp_frame, text=f"送去映射中心（后续完成列映射）",
+                        variable=self.disposition_var, value=BATCH_DISPOSITION_MAPPING).grid(row=0, column=0, sticky="w", **padding)
+        ttk.Radiobutton(disp_frame, text=f"存为草稿（直接生成 DRAFT 预约）",
+                        variable=self.disposition_var, value=BATCH_DISPOSITION_DRAFT).grid(row=0, column=1, sticky="w", **padding)
+        ttk.Radiobutton(disp_frame, text=f"退回（标记为退回，不做后续处理）",
+                        variable=self.disposition_var, value=BATCH_DISPOSITION_REJECT).grid(row=0, column=2, sticky="w", **padding)
+
+        self.btn_apply_disposition = ttk.Button(
+            disp_frame, text="▶ 确认去向（仅处理通过项）",
+            command=self._apply_disposition, width=24, state="disabled"
+        )
+        self.btn_apply_disposition.grid(row=0, column=3, padx=30)
+
+    def _build_tab3(self):
+        padding = {"padx": 8, "pady": 5}
+
+        filter_frame = ttk.Frame(self.tab3)
+        filter_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(filter_frame, text="操作人筛选：").pack(side="left", padx=(0, 5))
+        self.operator_filter_var = tk.StringVar()
+        ttk.Entry(filter_frame, textvariable=self.operator_filter_var, width=20).pack(side="left", padx=(0, 8))
+        ttk.Button(filter_frame, text="查询", command=self._refresh_batch_list, width=8).pack(side="left", padx=3)
+        self.include_revoked_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(filter_frame, text="包含已撤销", variable=self.include_revoked_var,
+                        command=self._refresh_batch_list).pack(side="left", padx=10)
+
+        batch_frame = ttk.LabelFrame(self.tab3, text="体检批次列表（普通用户仅见自己的批次）", padding=10)
+        batch_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        batch_cols = ("id", "created_at", "operator", "source_file", "encoding",
+                      "total", "passed", "failed", "disposition", "is_revoked", "snapshot_id")
+        self.batch_tree = ttk.Treeview(batch_frame, columns=batch_cols, show="headings", height=10)
+        for c, t, w in [
+            ("id", "批次ID", 80), ("created_at", "创建时间", 140), ("operator", "操作人", 80),
+            ("source_file", "源文件", 220), ("encoding", "编码", 70),
+            ("total", "总行", 50), ("passed", "通过", 50), ("failed", "失败", 50),
+            ("disposition", "去向", 100), ("is_revoked", "状态", 60), ("snapshot_id", "快照ID", 80),
+        ]:
+            self.batch_tree.heading(c, text=t)
+            self.batch_tree.column(c, width=w, anchor="w" if c not in ("total", "passed", "failed") else "center")
+        vsb3 = ttk.Scrollbar(batch_frame, orient="vertical", command=self.batch_tree.yview)
+        self.batch_tree.configure(yscrollcommand=vsb3.set)
+        self.batch_tree.pack(side="left", fill="both", expand=True)
+        vsb3.pack(side="right", fill="y")
+        self.batch_tree.tag_configure("revoked", foreground="#9e9e9e")
+        self.batch_tree.bind("<<TreeviewSelect>>", self._on_batch_select)
+
+        action_row = ttk.Frame(self.tab3)
+        action_row.pack(fill="x")
+
+        ttk.Button(action_row, text="查看批次详情", command=self._view_batch_detail, width=14).pack(side="left", padx=3)
+        ttk.Button(action_row, text="复跑该批次", command=self._rerun_selected_batch, width=14).pack(side="left", padx=3)
+        ttk.Button(action_row, text="导出此批次失败行", command=self._export_selected_batch_failed, width=18).pack(side="left", padx=3)
+        ttk.Button(action_row, text="导出此批次通过行", command=self._export_selected_batch_passed, width=18).pack(side="left", padx=3)
+
+        sep = ttk.Frame(action_row)
+        sep.pack(side="left", padx=15)
+
+        self.btn_restore_snapshot = ttk.Button(
+            action_row, text="恢复快照(管理员)", command=self._restore_selected_snapshot, width=18
+        )
+        self.btn_restore_snapshot.pack(side="left", padx=3)
+        self.btn_revoke_batch = ttk.Button(
+            action_row, text="撤销批次(管理员)", command=self._revoke_selected_batch, width=18
+        )
+        self.btn_revoke_batch.pack(side="left", padx=3)
+
+    # ==================== Tab1 Actions ====================
+    def _select_file(self):
+        initial_dir = getattr(self.dm.settings, "last_import_file_dir", None) or self.dm.settings.import_dir or os.path.expanduser("~")
+        filepath = filedialog.askopenfilename(
+            title="选择预约明细文件",
+            initialdir=initial_dir,
+            filetypes=[("支持的文件", "*.csv *.xlsx *.xls"), ("CSV 文件", "*.csv"), ("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if filepath:
+            self.file_var.set(filepath)
+            self.file_path = filepath
+            self.dm.settings.import_dir = os.path.dirname(filepath)
+            setattr(self.dm.settings, "last_import_file_dir", os.path.dirname(filepath))
+            self.dm.set_last_validation_file(filepath)
+            self.dm.save_settings()
+
+    def _refresh_mapping_scheme_list(self):
+        schemes = self.dm.list_mapping_schemes(include_revoked=True)
+        self._all_mapping_schemes = schemes
+        active = [s for s in schemes if not s.is_revoked]
+        self._active_mapping_schemes = active
+        display = [f"{s.name}（{s.updated_at[:16]}）" for s in active]
+        self.mapping_scheme_combo["values"] = display
+
+    def _on_mapping_scheme_select(self, _=None):
+        idx = self.mapping_scheme_combo.current()
+        if 0 <= idx < len(self._active_mapping_schemes):
+            self.current_mapping_scheme = self._active_mapping_schemes[idx]
+
+    def _refresh_validation_scheme_list(self):
+        schemes = self.dm.list_validation_schemes(include_revoked=True)
+        self._all_validation_schemes = schemes
+        active = [s for s in schemes if not s.is_revoked]
+        self._active_validation_schemes = active
+        display = [f"{s.name}（{s.updated_at[:16]}）" for s in active]
+        self.validation_scheme_combo["values"] = display
+
+    def _on_validation_scheme_select(self, _=None):
+        pass
+
+    def _load_selected_validation_scheme(self):
+        idx = self.validation_scheme_combo.current()
+        if idx < 0 or idx >= len(self._active_validation_schemes):
+            messagebox.showinfo("提示", "请先从下拉框选择体检方案", parent=self)
+            return
+        scheme = self._active_validation_schemes[idx]
+        self.current_validation_scheme = scheme
+        for rule in scheme.rules:
+            if rule.rule_key in self._rule_vars:
+                self._rule_vars[rule.rule_key].set(rule.enabled)
+        self.dm.set_last_validation_scheme(scheme.id)
+        messagebox.showinfo("成功", f"已加载体检方案「{scheme.name}」", parent=self)
+
+    def _collect_rules_from_ui(self) -> List[ImportValidationRule]:
+        rules = []
+        for rule_key, rule_desc, default_params in VALIDATION_RULE_DEFAULTS:
+            enabled = self._rule_vars.get(rule_key, tk.BooleanVar(value=True)).get()
+            rules.append(ImportValidationRule(
+                rule_key=rule_key, description=rule_desc, enabled=enabled, params=dict(default_params)
+            ))
+        return rules
+
+    def _save_as_new_validation_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可创建体检方案", parent=self)
+            return
+        name = simpledialog.askstring("新建体检方案", "请输入方案名称：", parent=self)
+        if not name or not name.strip():
+            return
+        rules = self._collect_rules_from_ui()
+        scheme, msg = self.dm.create_validation_scheme(
+            name=name.strip(), rules=rules,
+            operator=self.dm.settings.current_user, user_role=self.dm.settings.current_role,
+        )
+        if not scheme:
+            messagebox.showerror("创建失败", msg, parent=self)
+            return
+        self.current_validation_scheme = scheme
+        self._refresh_validation_scheme_list()
+        messagebox.showinfo("成功", f"体检方案「{name.strip()}」已创建", parent=self)
+
+    def _update_current_validation_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可修改体检方案", parent=self)
+            return
+        if not self.current_validation_scheme:
+            messagebox.showwarning("提示", "请先加载一个体检方案", parent=self)
+            return
+        rules = self._collect_rules_from_ui()
+        scheme, msg = self.dm.update_validation_scheme(
+            scheme_id=self.current_validation_scheme.id,
+            operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+            rules=rules,
+        )
+        if not scheme:
+            messagebox.showerror("更新失败", msg, parent=self)
+            return
+        self.current_validation_scheme = scheme
+        self._refresh_validation_scheme_list()
+        messagebox.showinfo("成功", f"体检方案「{scheme.name}」已更新", parent=self)
+
+    def _delete_selected_validation_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可删除体检方案", parent=self)
+            return
+        idx = self.validation_scheme_combo.current()
+        if idx < 0 or idx >= len(self._active_validation_schemes):
+            messagebox.showwarning("提示", "请先选择要删除的体检方案", parent=self)
+            return
+        scheme = self._active_validation_schemes[idx]
+        if not messagebox.askyesno("确认删除", f"确定要删除体检方案「{scheme.name}」吗？（不可恢复）", parent=self):
+            return
+        ok, msg = self.dm.delete_validation_scheme(
+            scheme.id, self.dm.settings.current_user, self.dm.settings.current_role
+        )
+        if not ok:
+            messagebox.showerror("删除失败", msg, parent=self)
+            return
+        self.current_validation_scheme = None
+        self._refresh_validation_scheme_list()
+        messagebox.showinfo("成功", "方案已删除", parent=self)
+
+    # ==================== Tab2 Actions ====================
+    def _run_validation(self):
+        filepath = self.file_var.get().strip()
+        if not filepath or not os.path.exists(filepath):
+            messagebox.showerror("错误", "请先选择有效的文件", parent=self)
+            return
+        self.file_path = filepath
+
+        idx = self.mapping_scheme_combo.current()
+        if idx < 0 or idx >= len(self._active_mapping_schemes):
+            messagebox.showerror("错误", "请先选择列映射方案", parent=self)
+            return
+        mapping_scheme = self._active_mapping_schemes[idx]
+        self.current_mapping_scheme = mapping_scheme
+
+        encoding = self.file_encoding_var.get()
+        setattr(self.dm.settings, "last_file_encoding", encoding)
+        self.dm.save_settings()
+
+        temp_rules = self._collect_rules_from_ui()
+        temp_vscheme = ImportValidationScheme(
+            id="_temp_", name="_临时_", created_by="", created_at="", updated_at="", rules=temp_rules,
+        )
+
+        batch, err = self.dm.run_validation_workbench(
+            filepath=filepath, mapping_scheme=mapping_scheme,
+            validation_scheme=temp_vscheme, file_encoding=encoding,
+        )
+        if not batch:
+            messagebox.showerror("体检失败", err, parent=self)
+            return
+
+        self.current_batch = batch
+        self._display_validation_result(batch)
+        self.btn_apply_disposition.config(state="normal")
+        self._refresh_batch_list()
+
+    def _display_validation_result(self, batch: ValidationBatch):
+        for item in self.issue_tree.get_children():
+            self.issue_tree.delete(item)
+
+        for issue in batch.issues:
+            tag = issue.issue_type
+            self.issue_tree.insert(
+                "", "end",
+                values=(issue.row_number, issue.issue_type, issue.column_name, issue.detail),
+                tags=(tag,),
+            )
+
+        summary = (f"批次 {batch.id} | 总计 {batch.total_rows} 行 | "
+                   f"通过 {batch.pass_rows} 行 | 失败 {batch.fail_rows} 行 | "
+                   f"问题 {len(batch.issues)} 条 | 编码={batch.file_encoding} | "
+                   f"来源：{os.path.basename(batch.source_file)}")
+        self.validation_summary.config(text=summary, foreground="#2e7d32" if batch.fail_rows == 0 else "#c62828")
+
+    def _export_failed_rows(self):
+        if not self.current_batch:
+            messagebox.showwarning("提示", "请先运行体检", parent=self)
+            return
+        initial_dir = getattr(self.dm.settings, "last_export_dir", None) or self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出体检失败行",
+            initialdir=initial_dir,
+            initialfile=f"体检失败行_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_validation_failed_rows(self.current_batch, filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        setattr(self.dm.settings, "last_export_dir", os.path.dirname(filepath))
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"失败行已导出到：\n{filepath}", parent=self)
+
+    def _export_passed_rows(self):
+        if not self.current_batch:
+            messagebox.showwarning("提示", "请先运行体检", parent=self)
+            return
+        initial_dir = getattr(self.dm.settings, "last_export_dir", None) or self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出体检通过行",
+            initialdir=initial_dir,
+            initialfile=f"体检通过行_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_validation_passed_rows(self.current_batch, filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        setattr(self.dm.settings, "last_export_dir", os.path.dirname(filepath))
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"通过行已导出到：\n{filepath}", parent=self)
+
+    def _apply_disposition(self):
+        if not self.current_batch:
+            messagebox.showerror("错误", "请先运行体检", parent=self)
+            return
+        disposition = self.disposition_var.get()
+        if disposition == BATCH_DISPOSITION_PENDING:
+            messagebox.showwarning("提示", "请先选择批次去向", parent=self)
+            return
+        ok, msg = self.dm.set_batch_disposition(
+            batch_id=self.current_batch.id, disposition=disposition,
+            operator=self.dm.settings.current_user, user_role=self.dm.settings.current_role,
+        )
+        if not ok:
+            messagebox.showerror("操作失败", msg, parent=self)
+            return
+        self._refresh_batch_list()
+        messagebox.showinfo("成功", f"批次去向已设为「{disposition}」\n\n{msg}", parent=self)
+
+    # ==================== Tab3 Actions ====================
+    def _refresh_batch_list(self):
+        operator_filter = self.operator_filter_var.get().strip()
+        include_revoked = self.include_revoked_var.get()
+        batches = self.dm.list_validation_batches(
+            operator_filter=operator_filter, include_revoked=include_revoked
+        )
+        for item in self.batch_tree.get_children():
+            self.batch_tree.delete(item)
+        for b in batches:
+            status = "已撤销" if b.is_revoked else "有效"
+            self.batch_tree.insert(
+                "", "end", iid=b.id,
+                values=(b.id[:8], b.created_at[:19], b.operator,
+                        os.path.basename(b.source_file), b.file_encoding,
+                        b.total_rows, b.pass_rows, b.fail_rows,
+                        b.disposition, status, (b.snapshot_id or "")[:8]),
+                tags=("revoked",) if b.is_revoked else (),
+            )
+
+    def _on_batch_select(self, _=None):
+        pass
+
+    def _get_selected_batch(self) -> Optional[ValidationBatch]:
+        sel = self.batch_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请先在列表中选择一个批次", parent=self)
+            return None
+        return self.dm.get_validation_batch(sel[0])
+
+    def _view_batch_detail(self):
+        batch = self._get_selected_batch()
+        if not batch:
+            return
+        self.current_batch = batch
+        self._display_validation_result(batch)
+        self.disposition_var.set(batch.disposition)
+        self.btn_apply_disposition.config(state="normal" if not batch.is_revoked else "disabled")
+        self.nb.select(self.tab2)
+
+    def _rerun_selected_batch(self):
+        batch = self._get_selected_batch()
+        if not batch:
+            return
+        idx = self.mapping_scheme_combo.current()
+        if idx < 0 or idx >= len(self._active_mapping_schemes):
+            messagebox.showerror("错误", "请先在Tab1选择列映射方案", parent=self)
+            return
+        mapping_scheme = self._active_mapping_schemes[idx]
+        encoding = self.file_encoding_var.get()
+        new_batch, err = self.dm.rerun_validation_batch(
+            batch_id=batch.id, operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+            mapping_scheme=mapping_scheme, file_encoding=encoding,
+        )
+        if not new_batch:
+            messagebox.showerror("复跑失败", err, parent=self)
+            return
+        self.current_batch = new_batch
+        self._display_validation_result(new_batch)
+        self._refresh_batch_list()
+        self.nb.select(self.tab2)
+        messagebox.showinfo("成功", f"批次复跑完成，新批次ID：{new_batch.id[:8]}", parent=self)
+
+    def _export_selected_batch_failed(self):
+        batch = self._get_selected_batch()
+        if not batch:
+            return
+        initial_dir = getattr(self.dm.settings, "last_export_dir", None) or self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title=f"导出批次 {batch.id[:8]} 失败行",
+            initialdir=initial_dir,
+            initialfile=f"批次{batch.id[:8]}_失败行_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_validation_failed_rows(batch, filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        setattr(self.dm.settings, "last_export_dir", os.path.dirname(filepath))
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"失败行已导出到：\n{filepath}", parent=self)
+
+    def _export_selected_batch_passed(self):
+        batch = self._get_selected_batch()
+        if not batch:
+            return
+        initial_dir = getattr(self.dm.settings, "last_export_dir", None) or self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title=f"导出批次 {batch.id[:8]} 通过行",
+            initialdir=initial_dir,
+            initialfile=f"批次{batch.id[:8]}_通过行_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_validation_passed_rows(batch, filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        setattr(self.dm.settings, "last_export_dir", os.path.dirname(filepath))
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"通过行已导出到：\n{filepath}", parent=self)
+
+    def _restore_selected_snapshot(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可恢复快照", parent=self)
+            return
+        batch = self._get_selected_batch()
+        if not batch or not batch.snapshot_id:
+            messagebox.showwarning("提示", "所选批次没有关联快照", parent=self)
+            return
+        if not messagebox.askyesno("确认恢复", f"确定要恢复批次 {batch.id[:8]} 的快照吗？\n这将基于快照重新创建体检批次。", parent=self):
+            return
+        new_batch, err = self.dm.restore_validation_snapshot(
+            snapshot_id=batch.snapshot_id, operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+        )
+        if not new_batch:
+            messagebox.showerror("恢复失败", err, parent=self)
+            return
+        self.current_batch = new_batch
+        self._display_validation_result(new_batch)
+        self._refresh_batch_list()
+        self.nb.select(self.tab2)
+        messagebox.showinfo("成功", f"快照已恢复，新批次ID：{new_batch.id[:8]}", parent=self)
+
+    def _revoke_selected_batch(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可撤销批次", parent=self)
+            return
+        batch = self._get_selected_batch()
+        if not batch:
+            return
+        if batch.is_revoked:
+            messagebox.showwarning("提示", "该批次已被撤销", parent=self)
+            return
+        reason = simpledialog.askstring("撤销批次", "请输入撤销原因：", parent=self)
+        if not reason or not reason.strip():
+            return
+        ok, msg = self.dm.revoke_validation_batch(
+            batch_id=batch.id, operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role, reason=reason.strip(),
+        )
+        if not ok:
+            messagebox.showerror("撤销失败", msg, parent=self)
+            return
+        self._refresh_batch_list()
+        messagebox.showinfo("成功", f"批次已撤销：{reason.strip()}", parent=self)
+
+    # ==================== Session Restore ====================
+    def _restore_session(self):
+        last_file = getattr(self.dm.settings, "last_validation_file", None)
+        if not last_file:
+            last_file = self.dm.get_last_validation_file() if hasattr(self.dm, "get_last_validation_file") else None
+        if last_file and os.path.exists(last_file):
+            self.file_var.set(last_file)
+            self.file_path = last_file
+            self.file_info_label.config(
+                text=f"上次会话恢复：{os.path.basename(last_file)}（编码：{getattr(self.dm.settings, 'last_file_encoding', 'auto')}）",
+                foreground="#1565c0"
+            )
+
+        last_encoding = getattr(self.dm.settings, "last_file_encoding", "auto")
+        if last_encoding:
+            self.file_encoding_var.set(last_encoding)
+
+        last_scheme = self.dm.get_last_validation_scheme() if hasattr(self.dm, "get_last_validation_scheme") else None
+        if last_scheme:
+            for i, s in enumerate(self._active_validation_schemes):
+                if s.id == last_scheme.id:
+                    self.validation_scheme_combo.current(i)
+                    self.current_validation_scheme = last_scheme
+                    for rule in last_scheme.rules:
+                        if rule.rule_key in self._rule_vars:
+                            self._rule_vars[rule.rule_key].set(rule.enabled)
+                    break
+
+        last_mapping = self.dm.get_last_mapping_scheme() if hasattr(self.dm, "get_last_mapping_scheme") else None
+        if last_mapping:
+            for i, s in enumerate(self._active_mapping_schemes):
+                if s.id == last_mapping.id:
+                    self.mapping_scheme_combo.current(i)
+                    self.current_mapping_scheme = last_mapping
+                    break
 
 
 if __name__ == "__main__":

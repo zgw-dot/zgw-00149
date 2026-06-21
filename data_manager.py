@@ -3468,3 +3468,1302 @@ class DataManager:
         )
 
         return draft, []
+
+
+# ===== Import Validation Workbench - Data Models =====
+
+@dataclass
+class ImportValidationRule:
+    rule_key: str
+    enabled: bool = True
+    params: Dict[str, Any] = field(default_factory=dict)
+    description: str = ""
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            rule_key=d["rule_key"],
+            enabled=d.get("enabled", True),
+            params=d.get("params", {}),
+            description=d.get("description", ""),
+        )
+
+
+@dataclass
+class ImportValidationScheme:
+    id: str
+    name: str
+    created_by: str
+    created_at: str
+    updated_at: str
+    rules: List[ImportValidationRule] = field(default_factory=list)
+    is_revoked: bool = False
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+    def to_dict(self):
+        d = asdict(self)
+        d["rules"] = [r.to_dict() for r in self.rules]
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        rules = [ImportValidationRule.from_dict(r) for r in d.get("rules", [])]
+        return cls(
+            id=d["id"],
+            name=d["name"],
+            created_by=d["created_by"],
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            rules=rules,
+            is_revoked=d.get("is_revoked", False),
+            revoked_by=d.get("revoked_by"),
+            revoked_at=d.get("revoked_at"),
+            revoke_reason=d.get("revoke_reason"),
+        )
+
+
+@dataclass
+class ValidationSnapshot:
+    id: str
+    batch_id: str
+    snapshot_time: str
+    source_file: str
+    file_encoding: str
+    scheme_id: str
+    scheme_name: str
+    raw_headers: List[str] = field(default_factory=list)
+    raw_rows: List[Dict[str, Any]] = field(default_factory=list)
+    precheck_result: Optional[PrecheckResult] = None
+    disposition: str = ""
+    operator: str = ""
+
+    def to_dict(self):
+        d = asdict(self)
+        if self.precheck_result:
+            d["precheck_result"] = self.precheck_result.to_dict()
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        precheck = None
+        if d.get("precheck_result"):
+            precheck = PrecheckResult.from_dict(d["precheck_result"])
+        return cls(
+            id=d["id"],
+            batch_id=d["batch_id"],
+            snapshot_time=d["snapshot_time"],
+            source_file=d["source_file"],
+            file_encoding=d.get("file_encoding", "utf-8-sig"),
+            scheme_id=d["scheme_id"],
+            scheme_name=d["scheme_name"],
+            raw_headers=d.get("raw_headers", []),
+            raw_rows=d.get("raw_rows", []),
+            precheck_result=precheck,
+            disposition=d.get("disposition", ""),
+            operator=d.get("operator", ""),
+        )
+
+
+@dataclass
+class ValidationBatch:
+    id: str
+    source_file: str
+    file_encoding: str
+    operator: str
+    operator_role: str
+    mapping_scheme_id: str
+    mapping_scheme_name: str
+    validation_scheme_id: str = ""
+    validation_scheme_name: str = ""
+    total_rows: int = 0
+    pass_rows: int = 0
+    fail_rows: int = 0
+    issues: List[PrecheckIssue] = field(default_factory=list)
+    disposition: str = ""
+    snapshot_id: str = ""
+    is_revoked: bool = False
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[str] = None
+    revoke_reason: Optional[str] = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self):
+        d = asdict(self)
+        d["issues"] = [i.to_dict() for i in self.issues]
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        issues = [PrecheckIssue.from_dict(i) for i in d.get("issues", [])]
+        return cls(
+            id=d["id"],
+            source_file=d["source_file"],
+            file_encoding=d.get("file_encoding", "utf-8-sig"),
+            operator=d["operator"],
+            operator_role=d["operator_role"],
+            mapping_scheme_id=d["mapping_scheme_id"],
+            mapping_scheme_name=d["mapping_scheme_name"],
+            validation_scheme_id=d.get("validation_scheme_id", ""),
+            validation_scheme_name=d.get("validation_scheme_name", ""),
+            total_rows=d.get("total_rows", 0),
+            pass_rows=d.get("pass_rows", 0),
+            fail_rows=d.get("fail_rows", 0),
+            issues=issues,
+            disposition=d.get("disposition", ""),
+            snapshot_id=d.get("snapshot_id", ""),
+            is_revoked=d.get("is_revoked", False),
+            revoked_by=d.get("revoked_by"),
+            revoked_at=d.get("revoked_at"),
+            revoke_reason=d.get("revoke_reason"),
+            created_at=d.get("created_at", ""),
+            updated_at=d.get("updated_at", ""),
+        )
+
+
+BATCH_DISPOSITION_MAPPING = "送去映射中心"
+BATCH_DISPOSITION_DRAFT = "存为草稿"
+BATCH_DISPOSITION_REJECT = "退回"
+BATCH_DISPOSITION_PENDING = "待处理"
+
+
+VALIDATION_RULE_DEFAULTS = [
+    ("required_columns", "缺少必填列检查", {"columns": ["instrument_code", "applicant", "start_time", "end_time", "purpose"]}),
+    ("empty_values", "空值检查", {}),
+    ("time_format", "时间格式检查", {}),
+    ("time_logic", "时间逻辑检查（开始<结束）", {}),
+    ("duplicate_rows", "重复行检查（同仪器同时段）", {}),
+    ("instrument_conflict", "同仪器撞时段（与已有预约）", {}),
+    ("applicant_conflict", "同申请人撞单（同日期多单）", {}),
+    ("instrument_exists", "仪器存在性检查", {}),
+]
+
+
+# ===== OperationType extension =====
+
+def _extend_operation_type():
+    if not hasattr(OperationType, "VALIDATION_SCHEME_CREATE"):
+        OperationType.VALIDATION_SCHEME_CREATE = "体检方案创建"
+        OperationType.VALIDATION_SCHEME_UPDATE = "体检方案更新"
+        OperationType.VALIDATION_SCHEME_DELETE = "体检方案删除"
+        OperationType.VALIDATION_SCHEME_REVOKE = "体检方案撤销"
+        OperationType.VALIDATION_BATCH_RUN = "批次体检执行"
+        OperationType.VALIDATION_BATCH_EXPORT_FAIL = "批次失败行导出"
+        OperationType.VALIDATION_BATCH_EXPORT_PASS = "批次通过行导出"
+        OperationType.VALIDATION_BATCH_DISPOSITION = "批次去向处理"
+        OperationType.VALIDATION_BATCH_REVOKE = "批次导入撤销"
+        OperationType.VALIDATION_BATCH_RESTORE = "批次快照恢复"
+        OperationType.VALIDATION_BATCH_RERUN = "批次复跑"
+
+
+_extend_operation_type()
+
+
+# ===== DataManager extension =====
+
+def _extend_data_manager_init(self):
+    self.validation_schemes_file = os.path.join(self.data_dir, "validation_schemes.json")
+    self.validation_batches_file = os.path.join(self.data_dir, "validation_batches.json")
+    self.validation_snapshots_file = os.path.join(self.data_dir, "validation_snapshots.json")
+    self.validation_schemes: List[ImportValidationScheme] = []
+    self.validation_batches: List[ValidationBatch] = []
+    self.validation_snapshots: List[ValidationSnapshot] = []
+
+
+DataManager._extend_init = _extend_data_manager_init
+
+
+def _extend_data_manager_load_all(self):
+    self.load_validation_schemes()
+    self.load_validation_batches()
+    self.load_validation_snapshots()
+
+
+DataManager._extend_load_all = _extend_data_manager_load_all
+
+
+_original_dm_init = DataManager.__init__
+
+
+def _patched_dm_init(self, data_dir: str = None):
+    _original_dm_init(self, data_dir)
+    self._extend_init()
+    self._extend_load_all()
+
+
+DataManager.__init__ = _patched_dm_init
+
+
+# ---- Validation Scheme CRUD ----
+
+def load_validation_schemes(self):
+    if os.path.exists(self.validation_schemes_file):
+        with open(self.validation_schemes_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.validation_schemes = [ImportValidationScheme.from_dict(d) for d in data]
+    else:
+        self.validation_schemes = []
+
+
+def save_validation_schemes(self):
+    with open(self.validation_schemes_file, "w", encoding="utf-8") as f:
+        json.dump([s.to_dict() for s in self.validation_schemes], f, ensure_ascii=False, indent=2)
+
+
+def create_default_validation_scheme(self) -> ImportValidationScheme:
+    rules = [
+        ImportValidationRule(rule_key=rk, enabled=True, params=p, description=desc)
+        for rk, desc, p in VALIDATION_RULE_DEFAULTS
+    ]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scheme = ImportValidationScheme(
+        id=str(uuid.uuid4()),
+        name="默认体检方案",
+        created_by="system",
+        created_at=now,
+        updated_at=now,
+        rules=rules,
+    )
+    self.validation_schemes.append(scheme)
+    self.save_validation_schemes()
+    return scheme
+
+
+def create_validation_scheme(self, name: str, rules: List[ImportValidationRule],
+                              operator: str, user_role: UserRole
+                              ) -> Tuple[Optional[ImportValidationScheme], str]:
+    if user_role != UserRole.ADMIN:
+        return None, "仅管理员可创建体检方案"
+    name = name.strip() if name else ""
+    if not name:
+        return None, "方案名称不能为空"
+    for s in self.validation_schemes:
+        if s.name == name and not s.is_revoked:
+            return None, f"方案名称「{name}」已存在"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scheme = ImportValidationScheme(
+        id=str(uuid.uuid4()),
+        name=name,
+        created_by=operator,
+        created_at=now,
+        updated_at=now,
+        rules=list(rules),
+    )
+    self.validation_schemes.append(scheme)
+    self.save_validation_schemes()
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_SCHEME_CREATE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"创建体检方案：{name}",
+        detail=f"方案ID={scheme.id}, 规则数={len(rules)}",
+    )
+    return scheme, ""
+
+
+def update_validation_scheme(self, scheme_id: str, operator: str, user_role: UserRole,
+                              **kwargs) -> Tuple[Optional[ImportValidationScheme], str]:
+    if user_role != UserRole.ADMIN:
+        return None, "仅管理员可修改体检方案"
+    scheme = self.get_validation_scheme(scheme_id)
+    if not scheme:
+        return None, "体检方案不存在"
+    if scheme.is_revoked:
+        return None, "已撤销的方案不能修改"
+    if "name" in kwargs:
+        new_name = kwargs["name"].strip() if kwargs["name"] else ""
+        if not new_name:
+            return None, "方案名称不能为空"
+        for s in self.validation_schemes:
+            if s.id != scheme_id and s.name == new_name and not s.is_revoked:
+                return None, f"方案名称「{new_name}」已存在"
+        kwargs["name"] = new_name
+    for key, value in kwargs.items():
+        if hasattr(scheme, key):
+            setattr(scheme, key, value)
+    scheme.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    self.save_validation_schemes()
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_SCHEME_UPDATE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"更新体检方案：{scheme.name}",
+        detail=f"方案ID={scheme_id}, 更新字段={list(kwargs.keys())}",
+    )
+    return scheme, ""
+
+
+def delete_validation_scheme(self, scheme_id: str, operator: str,
+                              user_role: UserRole) -> Tuple[bool, str]:
+    if user_role != UserRole.ADMIN:
+        return False, "仅管理员可删除体检方案"
+    scheme = None
+    idx = -1
+    for i, s in enumerate(self.validation_schemes):
+        if s.id == scheme_id:
+            scheme = s
+            idx = i
+            break
+    if not scheme:
+        return False, "体检方案不存在"
+    name = scheme.name
+    del self.validation_schemes[idx]
+    self.save_validation_schemes()
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_SCHEME_DELETE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"删除体检方案：{name}",
+        detail=f"方案ID={scheme_id}",
+    )
+    return True, ""
+
+
+def revoke_validation_scheme(self, scheme_id: str, operator: str, user_role: UserRole,
+                              reason: str) -> Tuple[Optional[ImportValidationScheme], str]:
+    if user_role != UserRole.ADMIN:
+        return None, "仅管理员可撤销体检方案"
+    scheme = self.get_validation_scheme(scheme_id)
+    if not scheme:
+        return None, "体检方案不存在"
+    if scheme.is_revoked:
+        return None, "该方案已被撤销"
+    scheme.is_revoked = True
+    scheme.revoked_by = operator
+    scheme.revoked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scheme.revoke_reason = reason
+    scheme.updated_at = scheme.revoked_at
+    self.save_validation_schemes()
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_SCHEME_REVOKE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"撤销体检方案：{scheme.name}",
+        detail=f"方案ID={scheme_id}, 原因={reason}",
+    )
+    return scheme, ""
+
+
+def get_validation_scheme(self, scheme_id: str) -> Optional[ImportValidationScheme]:
+    for s in self.validation_schemes:
+        if s.id == scheme_id:
+            return s
+    return None
+
+
+def list_validation_schemes(self, include_revoked: bool = False) -> List[ImportValidationScheme]:
+    results = [s for s in self.validation_schemes if include_revoked or not s.is_revoked]
+    results.sort(key=lambda s: s.updated_at, reverse=True)
+    if not results and not include_revoked:
+        return [self.create_default_validation_scheme()]
+    return results
+
+
+DataManager.load_validation_schemes = load_validation_schemes
+DataManager.save_validation_schemes = save_validation_schemes
+DataManager.create_default_validation_scheme = create_default_validation_scheme
+DataManager.create_validation_scheme = create_validation_scheme
+DataManager.update_validation_scheme = update_validation_scheme
+DataManager.delete_validation_scheme = delete_validation_scheme
+DataManager.revoke_validation_scheme = revoke_validation_scheme
+DataManager.get_validation_scheme = get_validation_scheme
+DataManager.list_validation_schemes = list_validation_schemes
+
+
+# ---- Batch & Snapshot Persistence ----
+
+def load_validation_batches(self):
+    if os.path.exists(self.validation_batches_file):
+        with open(self.validation_batches_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.validation_batches = [ValidationBatch.from_dict(d) for d in data]
+    else:
+        self.validation_batches = []
+
+
+def save_validation_batches(self):
+    with open(self.validation_batches_file, "w", encoding="utf-8") as f:
+        json.dump([b.to_dict() for b in self.validation_batches], f, ensure_ascii=False, indent=2)
+
+
+def load_validation_snapshots(self):
+    if os.path.exists(self.validation_snapshots_file):
+        with open(self.validation_snapshots_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.validation_snapshots = [ValidationSnapshot.from_dict(d) for d in data]
+    else:
+        self.validation_snapshots = []
+
+
+def save_validation_snapshots(self):
+    with open(self.validation_snapshots_file, "w", encoding="utf-8") as f:
+        json.dump([s.to_dict() for s in self.validation_snapshots], f, ensure_ascii=False, indent=2)
+
+
+DataManager.load_validation_batches = load_validation_batches
+DataManager.save_validation_batches = save_validation_batches
+DataManager.load_validation_snapshots = load_validation_snapshots
+DataManager.save_validation_snapshots = save_validation_snapshots
+
+
+# ---- AppSettings extension for encoding & export dir ----
+
+_original_settings_to_dict = AppSettings.to_dict
+_original_settings_from_dict = AppSettings.from_dict
+
+
+def _patched_settings_to_dict(self):
+    d = _original_settings_to_dict(self)
+    if hasattr(self, "last_file_encoding"):
+        d["last_file_encoding"] = self.last_file_encoding
+    if hasattr(self, "last_export_dir"):
+        d["last_export_dir"] = self.last_export_dir
+    if hasattr(self, "last_validation_scheme_id"):
+        d["last_validation_scheme_id"] = self.last_validation_scheme_id
+    return d
+
+
+def _patched_settings_from_dict(cls, d):
+    obj = _original_settings_from_dict(d)
+    obj.last_file_encoding = d.get("last_file_encoding", "utf-8-sig")
+    obj.last_export_dir = d.get("last_export_dir", "")
+    obj.last_validation_scheme_id = d.get("last_validation_scheme_id", "")
+    return obj
+
+
+AppSettings.to_dict = _patched_settings_to_dict
+AppSettings.from_dict = classmethod(_patched_settings_from_dict)
+
+
+def _ensure_settings_extensions(self):
+    if not hasattr(self.settings, "last_file_encoding"):
+        self.settings.last_file_encoding = "utf-8-sig"
+    if not hasattr(self.settings, "last_export_dir"):
+        self.settings.last_export_dir = ""
+    if not hasattr(self.settings, "last_validation_scheme_id"):
+        self.settings.last_validation_scheme_id = ""
+
+
+DataManager._ensure_settings_extensions = _ensure_settings_extensions
+
+
+_original_dm_load_settings = DataManager.load_settings
+
+
+def _patched_dm_load_settings(self):
+    _original_dm_load_settings(self)
+    self._ensure_settings_extensions()
+
+
+DataManager.load_settings = _patched_dm_load_settings
+
+
+def set_last_file_encoding(self, encoding: str):
+    self._ensure_settings_extensions()
+    self.settings.last_file_encoding = encoding
+    self.save_settings()
+
+
+def get_last_file_encoding(self) -> str:
+    self._ensure_settings_extensions()
+    return getattr(self.settings, "last_file_encoding", "utf-8-sig")
+
+
+def set_last_export_dir(self, export_dir: str):
+    self._ensure_settings_extensions()
+    self.settings.last_export_dir = export_dir
+    self.save_settings()
+
+
+def get_last_export_dir(self) -> str:
+    self._ensure_settings_extensions()
+    return getattr(self.settings, "last_export_dir", "")
+
+
+def set_last_validation_scheme(self, scheme_id: str):
+    self._ensure_settings_extensions()
+    self.settings.last_validation_scheme_id = scheme_id
+    self.save_settings()
+
+
+def get_last_validation_scheme(self) -> Optional[ImportValidationScheme]:
+    self._ensure_settings_extensions()
+    sid = getattr(self.settings, "last_validation_scheme_id", "")
+    if not sid:
+        return None
+    return self.get_validation_scheme(sid)
+
+
+def set_last_validation_file(self, filepath: str):
+    self._ensure_settings_extensions()
+    self.settings.last_validation_file = filepath
+    self.settings.last_import_file_dir = os.path.dirname(filepath)
+    self.save_settings()
+
+
+def get_last_validation_file(self) -> str:
+    self._ensure_settings_extensions()
+    return getattr(self.settings, "last_validation_file", "")
+
+
+DataManager.set_last_file_encoding = set_last_file_encoding
+DataManager.get_last_file_encoding = get_last_file_encoding
+DataManager.set_last_export_dir = set_last_export_dir
+DataManager.get_last_export_dir = get_last_export_dir
+DataManager.set_last_validation_scheme = set_last_validation_scheme
+DataManager.get_last_validation_scheme = get_last_validation_scheme
+DataManager.set_last_validation_file = set_last_validation_file
+DataManager.get_last_validation_file = get_last_validation_file
+
+
+# ---- Enhanced File Parsing with encoding selection ----
+
+def parse_import_file_with_encoding(self, filepath: str, encoding: str = "auto"
+                                     ) -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], str]:
+    ext = os.path.splitext(filepath)[1].lower()
+    try:
+        if ext == ".csv":
+            return self._parse_csv_file_with_encoding(filepath, encoding)
+        elif ext in (".xlsx", ".xls"):
+            return self._parse_excel_file(filepath)
+        else:
+            return None, None, f"不支持的文件格式：{ext}，仅支持 .csv/.xlsx/.xls"
+    except Exception as e:
+        return None, None, f"文件读取失败：{str(e)}"
+
+
+def _parse_csv_file_with_encoding(self, filepath: str, encoding: str
+                                   ) -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], str]:
+    encodings_to_try = []
+    if encoding and encoding.lower() != "auto":
+        encodings_to_try = [encoding]
+    else:
+        last_enc = self.get_last_file_encoding()
+        encodings_to_try = [last_enc, "utf-8-sig", "utf-8", "gbk"]
+    last_err = None
+    for enc in encodings_to_try:
+        try:
+            with open(filepath, "r", encoding=enc) as f:
+                reader = csv.DictReader(f)
+                headers = list(reader.fieldnames) if reader.fieldnames else []
+                if not headers:
+                    return None, None, "CSV文件无表头"
+                rows = []
+                for row in reader:
+                    cleaned = {}
+                    for h in headers:
+                        val = row.get(h, "")
+                        if val is None:
+                            val = ""
+                        cleaned[h] = str(val).strip()
+                    rows.append(cleaned)
+            self.set_last_file_encoding(enc)
+            return headers, rows, ""
+        except UnicodeDecodeError as e:
+            last_err = f"编码{enc}解码失败: {str(e)}"
+            continue
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return None, None, f"CSV文件读取失败，尝试的编码均失败。最后错误：{last_err}"
+
+
+def _parse_csv_file_patched(self, filepath: str):
+    return self._parse_csv_file_with_encoding(filepath, "auto")
+
+
+DataManager.parse_import_file_with_encoding = parse_import_file_with_encoding
+DataManager._parse_csv_file_with_encoding = _parse_csv_file_with_encoding
+DataManager._parse_csv_file = _parse_csv_file_patched
+
+
+# ---- Enhanced Validation Engine ----
+
+def run_validation_workbench(self, filepath: str, mapping_scheme: ImportMappingScheme,
+                              validation_scheme: Optional[ImportValidationScheme] = None,
+                              file_encoding: str = "auto"
+                              ) -> Tuple[Optional[ValidationBatch], str]:
+    if not mapping_scheme:
+        return None, "映射方案为空"
+    if mapping_scheme.is_revoked:
+        return None, "不能使用已撤销的映射方案"
+
+    if validation_scheme is None:
+        schemes = self.list_validation_schemes()
+        if schemes:
+            validation_scheme = schemes[0]
+        else:
+            validation_scheme = self.create_default_validation_scheme()
+
+    if validation_scheme and validation_scheme.is_revoked:
+        return None, "不能使用已撤销的体检方案"
+
+    headers, rows, err = self.parse_import_file_with_encoding(filepath, file_encoding)
+    if err:
+        return None, err
+    if not rows:
+        return None, "文件无有效数据行"
+
+    actual_encoding = self.get_last_file_encoding()
+
+    enabled_rules = {}
+    if validation_scheme:
+        for r in validation_scheme.rules:
+            enabled_rules[r.rule_key] = (r.enabled, r.params)
+
+    mapping = mapping_scheme.column_mapping
+    issues: List[PrecheckIssue] = []
+    standard_rows: List[Dict[str, Any]] = []
+    required_std = ["instrument_code", "applicant", "start_time", "end_time", "purpose"]
+    std_name_map = {k: v for k, v in STANDARD_COLUMNS}
+
+    rule_required, _ = enabled_rules.get("required_columns", (True, {}))
+    if rule_required:
+        missing_std = []
+        for std in required_std:
+            if std not in mapping or not mapping[std]:
+                missing_std.append(std_name_map.get(std, std))
+        if missing_std:
+            issues.append(PrecheckIssue(
+                row_number=1,
+                issue_type="缺少必填列",
+                column_name="表头",
+                detail=f"映射方案缺少必填列：{', '.join(missing_std)}",
+                raw_row={},
+            ))
+
+    has_date_col = "reservation_date" in mapping and mapping["reservation_date"]
+    row_fail_flags: Dict[int, bool] = {}
+
+    for idx, row in enumerate(rows):
+        row_num = idx + 2
+        row_issues: List[PrecheckIssue] = []
+        std_row: Dict[str, Any] = {}
+        row_ok = True
+
+        for std_key, raw_col in mapping.items():
+            if not raw_col:
+                continue
+            if raw_col not in row:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="缺列",
+                    column_name=std_name_map.get(std_key, std_key),
+                    detail=f"原始列「{raw_col}」不存在于文件表头中",
+                    raw_row=row,
+                ))
+                row_ok = False
+                continue
+            val = row.get(raw_col, "")
+            rule_empty, _ = enabled_rules.get("empty_values", (True, {}))
+            if rule_empty and std_key in required_std and not val:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="空值",
+                    column_name=std_name_map.get(std_key, std_key),
+                    detail=f"列「{raw_col}」值为空",
+                    raw_row=row,
+                ))
+                row_ok = False
+            std_row[std_key] = val
+
+        if has_date_col and "reservation_date" in mapping and mapping["reservation_date"]:
+            date_val = row.get(mapping["reservation_date"], "")
+            start_val = std_row.get("start_time", "")
+            end_val = std_row.get("end_time", "")
+            if date_val and start_val and " " not in start_val:
+                try:
+                    combined_start = f"{date_val} {start_val}"
+                    datetime.strptime(combined_start, f"{mapping_scheme.date_format} {mapping_scheme.time_format}")
+                    std_row["start_time"] = combined_start
+                except ValueError:
+                    pass
+            if date_val and end_val and " " not in end_val:
+                try:
+                    combined_end = f"{date_val} {end_val}"
+                    datetime.strptime(combined_end, f"{mapping_scheme.date_format} {mapping_scheme.time_format}")
+                    std_row["end_time"] = combined_end
+                except ValueError:
+                    pass
+
+        start_str = std_row.get("start_time", "")
+        end_str = std_row.get("end_time", "")
+        start_dt = None
+        end_dt = None
+        rule_time_fmt, _ = enabled_rules.get("time_format", (True, {}))
+        rule_time_logic, _ = enabled_rules.get("time_logic", (True, {}))
+
+        if start_str and rule_time_fmt:
+            parsed = False
+            for fmt in [mapping_scheme.datetime_format, "%Y-%m-%d %H:%M:%S",
+                        f"{mapping_scheme.date_format} {mapping_scheme.time_format}"]:
+                try:
+                    start_dt = datetime.strptime(start_str, fmt)
+                    std_row["start_time"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    parsed = True
+                    break
+                except (ValueError, TypeError):
+                    continue
+            if not parsed and start_dt is None:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="时间格式错",
+                    column_name="开始时间",
+                    detail=f"「{start_str}」无法按格式解析（尝试了{mapping_scheme.datetime_format}等）",
+                    raw_row=row,
+                ))
+                row_ok = False
+
+        if end_str and rule_time_fmt:
+            parsed = False
+            for fmt in [mapping_scheme.datetime_format, "%Y-%m-%d %H:%M:%S",
+                        f"{mapping_scheme.date_format} {mapping_scheme.time_format}"]:
+                try:
+                    end_dt = datetime.strptime(end_str, fmt)
+                    std_row["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    parsed = True
+                    break
+                except (ValueError, TypeError):
+                    continue
+            if not parsed and end_dt is None:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="时间格式错",
+                    column_name="结束时间",
+                    detail=f"「{end_str}」无法按格式解析（尝试了{mapping_scheme.datetime_format}等）",
+                    raw_row=row,
+                ))
+                row_ok = False
+
+        if start_dt and end_dt and rule_time_logic and start_dt >= end_dt:
+            row_issues.append(PrecheckIssue(
+                row_number=row_num,
+                issue_type="时间逻辑错",
+                column_name="结束时间",
+                detail=f"开始时间「{std_row['start_time']}」不早于结束时间「{std_row['end_time']}」",
+                raw_row=row,
+            ))
+            row_ok = False
+
+        ins_code = std_row.get("instrument_code", "")
+        rule_ins_exists, _ = enabled_rules.get("instrument_exists", (True, {}))
+        if ins_code and rule_ins_exists:
+            ins = self.get_instrument_by_code(ins_code)
+            if not ins:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="仪器不存在",
+                    column_name="仪器编号",
+                    detail=f"仪器编号「{ins_code}」在系统中不存在",
+                    raw_row=row,
+                ))
+                row_ok = False
+
+        issues.extend(row_issues)
+        if not row_ok:
+            row_fail_flags[idx] = True
+        if row_ok:
+            std_row["_row_idx"] = idx
+            standard_rows.append(std_row)
+
+    rule_dup, _ = enabled_rules.get("duplicate_rows", (True, {}))
+    if rule_dup:
+        seen_keys = {}
+        dup_indices = set()
+        for i, srow in enumerate(standard_rows):
+            key = (srow.get("instrument_code", ""), srow.get("start_time", ""), srow.get("end_time", ""))
+            if key in seen_keys:
+                original_idx = seen_keys[key]
+                dup_indices.add(i)
+                orig_raw = {}
+                this_raw = {}
+                orig_row_num = 0
+                this_row_num = 0
+                for idx2, raw in enumerate(rows):
+                    match_orig = True
+                    match_this = True
+                    for std_k in ["instrument_code", "applicant"]:
+                        if std_k in mapping and mapping[std_k]:
+                            if raw.get(mapping[std_k], "") != standard_rows[original_idx].get(std_k, ""):
+                                match_orig = False
+                            if raw.get(mapping[std_k], "") != srow.get(std_k, ""):
+                                match_this = False
+                    if match_orig and not orig_row_num:
+                        orig_row_num = idx2 + 2
+                        orig_raw = raw
+                    if match_this and not this_row_num:
+                        this_row_num = idx2 + 2
+                        this_raw = raw
+                    if orig_row_num and this_row_num:
+                        break
+                issues.append(PrecheckIssue(
+                    row_number=this_row_num,
+                    issue_type="重复行",
+                    column_name="仪器+时间段",
+                    detail=f"与第{orig_row_num}行数据重复（仪器相同、时间段相同）",
+                    raw_row=this_raw,
+                ))
+            else:
+                seen_keys[key] = i
+
+        standard_rows = [s for i, s in enumerate(standard_rows) if i not in dup_indices]
+
+    rule_ins_conflict, _ = enabled_rules.get("instrument_conflict", (True, {}))
+    if rule_ins_conflict:
+        active_statuses = [
+            ReservationStatus.DRAFT,
+            ReservationStatus.CONFIRMED,
+            ReservationStatus.IN_USE,
+            ReservationStatus.PENDING_REVIEW,
+        ]
+        for srow in list(standard_rows):
+            ins_code = srow.get("instrument_code", "")
+            start_str = srow.get("start_time", "")
+            end_str = srow.get("end_time", "")
+            ins = self.get_instrument_by_code(ins_code)
+            if not ins or not start_str or not end_str:
+                continue
+            try:
+                new_start = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+                new_end = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            conflict_found = False
+            for r in self.reservations:
+                if r.instrument_id != ins.id:
+                    continue
+                if r.status not in active_statuses:
+                    continue
+                try:
+                    r_start = datetime.strptime(r.start_time, "%Y-%m-%d %H:%M:%S")
+                    r_end = datetime.strptime(r.end_time, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if new_start < r_end and new_end > r_start:
+                    row_idx = srow.get("_row_idx", -1)
+                    row_num = row_idx + 2 if row_idx >= 0 else 0
+                    raw_row = rows[row_idx] if 0 <= row_idx < len(rows) else {}
+                    issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="同仪器撞时段",
+                        column_name="时间段",
+                        detail=f"仪器{ins_code}时段与已有预约冲突（{r.applicant} - {r.start_time}至{r.end_time}）",
+                        raw_row=raw_row,
+                    ))
+                    conflict_found = True
+                    break
+            if conflict_found and srow in standard_rows:
+                standard_rows.remove(srow)
+
+    rule_applicant_conflict, _ = enabled_rules.get("applicant_conflict", (True, {}))
+    if rule_applicant_conflict:
+        active_statuses = [
+            ReservationStatus.DRAFT,
+            ReservationStatus.CONFIRMED,
+            ReservationStatus.IN_USE,
+            ReservationStatus.PENDING_REVIEW,
+        ]
+        applicant_dates: Dict[str, set] = {}
+        for srow in standard_rows:
+            applicant = srow.get("applicant", "")
+            start_str = srow.get("start_time", "")
+            if not applicant or not start_str:
+                continue
+            try:
+                start_dt = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+                date_key = start_dt.strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+            if applicant not in applicant_dates:
+                applicant_dates[applicant] = set()
+            if date_key in applicant_dates[applicant]:
+                row_idx = srow.get("_row_idx", -1)
+                row_num = row_idx + 2 if row_idx >= 0 else 0
+                raw_row = rows[row_idx] if 0 <= row_idx < len(rows) else {}
+                issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="同申请人撞单",
+                    column_name="申请人+日期",
+                    detail=f"申请人{applicant}在{date_key}已有其他预约（批次内重复）",
+                    raw_row=raw_row,
+                ))
+                if srow in standard_rows:
+                    standard_rows.remove(srow)
+                continue
+            applicant_dates[applicant].add(date_key)
+            for r in self.reservations:
+                if r.applicant != applicant:
+                    continue
+                if r.status not in active_statuses:
+                    continue
+                try:
+                    r_start = datetime.strptime(r.start_time, "%Y-%m-%d %H:%M:%S")
+                    r_date = r_start.strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+                if r_date == date_key:
+                    row_idx = srow.get("_row_idx", -1)
+                    row_num = row_idx + 2 if row_idx >= 0 else 0
+                    raw_row = rows[row_idx] if 0 <= row_idx < len(rows) else {}
+                    issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="同申请人撞单",
+                        column_name="申请人+日期",
+                        detail=f"申请人{applicant}在{date_key}已有预约（{r.instrument_code} - {r.start_time}）",
+                        raw_row=raw_row,
+                    ))
+                    if srow in standard_rows:
+                        standard_rows.remove(srow)
+                    break
+
+    for srow in standard_rows:
+        srow.pop("_row_idx", None)
+
+    batch_id = str(uuid.uuid4())
+    snapshot_id = str(uuid.uuid4())
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    precheck_for_snapshot = PrecheckResult(
+        source_file=os.path.basename(filepath),
+        scheme_id=mapping_scheme.id,
+        scheme_name=mapping_scheme.name,
+        total_rows=len(rows),
+        pass_rows=len(standard_rows),
+        fail_rows=len(rows) - len(standard_rows),
+        issues=issues,
+        standard_rows=standard_rows,
+        timestamp=now,
+    )
+
+    snapshot = ValidationSnapshot(
+        id=snapshot_id,
+        batch_id=batch_id,
+        snapshot_time=now,
+        source_file=filepath,
+        file_encoding=actual_encoding,
+        scheme_id=mapping_scheme.id,
+        scheme_name=mapping_scheme.name,
+        raw_headers=headers or [],
+        raw_rows=rows,
+        precheck_result=precheck_for_snapshot,
+        disposition=BATCH_DISPOSITION_PENDING,
+        operator=self.settings.current_user,
+    )
+    self.validation_snapshots.insert(0, snapshot)
+    self.save_validation_snapshots()
+
+    batch = ValidationBatch(
+        id=batch_id,
+        source_file=os.path.basename(filepath),
+        file_encoding=actual_encoding,
+        operator=self.settings.current_user,
+        operator_role=self.settings.current_role.value,
+        mapping_scheme_id=mapping_scheme.id,
+        mapping_scheme_name=mapping_scheme.name,
+        validation_scheme_id=validation_scheme.id if validation_scheme else "",
+        validation_scheme_name=validation_scheme.name if validation_scheme else "",
+        total_rows=len(rows),
+        pass_rows=len(standard_rows),
+        fail_rows=len(rows) - len(standard_rows),
+        issues=issues,
+        disposition=BATCH_DISPOSITION_PENDING,
+        snapshot_id=snapshot_id,
+        created_at=now,
+        updated_at=now,
+    )
+    self.validation_batches.insert(0, batch)
+    self.save_validation_batches()
+
+    self.settings.mapping_import_session.last_file_path = filepath
+    self.settings.mapping_import_session.last_scheme_id = mapping_scheme.id
+    self.settings.mapping_import_session.last_precheck_result = precheck_for_snapshot
+    self.set_last_validation_scheme(validation_scheme.id if validation_scheme else "")
+    self.save_settings()
+
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_BATCH_RUN,
+        operator=self.settings.current_user,
+        operator_role=self.settings.current_role.value,
+        description=f"批次体检：文件「{os.path.basename(filepath)}」，映射「{mapping_scheme.name}」",
+        detail=f"批次ID={batch_id}, 共{len(rows)}行，通过{len(standard_rows)}行，失败{len(rows)-len(standard_rows)}行，问题{len(issues)}条",
+    )
+
+    return batch, ""
+
+
+DataManager.run_validation_workbench = run_validation_workbench
+
+
+# ---- Batch Listing with Permission Filtering ----
+
+def list_validation_batches(self, operator_filter: str = "", include_revoked: bool = True) -> List[ValidationBatch]:
+    results = list(self.validation_batches)
+    if not include_revoked:
+        results = [b for b in results if not b.is_revoked]
+    if operator_filter:
+        results = [b for b in results if b.operator == operator_filter]
+    if self.settings.current_role != UserRole.ADMIN:
+        results = [b for b in results if b.operator == self.settings.current_user]
+    results.sort(key=lambda b: b.created_at, reverse=True)
+    return results
+
+
+def get_validation_batch(self, batch_id: str) -> Optional[ValidationBatch]:
+    for b in self.validation_batches:
+        if b.id == batch_id:
+            if self.settings.current_role != UserRole.ADMIN and b.operator != self.settings.current_user:
+                return None
+            return b
+    return None
+
+
+def get_validation_snapshot(self, snapshot_id: str) -> Optional[ValidationSnapshot]:
+    for s in self.validation_snapshots:
+        if s.id == snapshot_id:
+            return s
+    return None
+
+
+DataManager.list_validation_batches = list_validation_batches
+DataManager.get_validation_batch = get_validation_batch
+DataManager.get_validation_snapshot = get_validation_snapshot
+
+
+# ---- Batch Disposition (送映射/存草稿/退回) ----
+
+def set_batch_disposition(self, batch_id: str, disposition: str, operator: str,
+                           user_role: UserRole) -> Tuple[Optional[ValidationBatch], str]:
+    batch = self.get_validation_batch(batch_id)
+    if not batch:
+        return None, "批次不存在"
+    if user_role != UserRole.ADMIN and batch.operator != operator:
+        return None, "无权处理他人的批次"
+    if batch.is_revoked:
+        return None, "该批次已被撤销，无法处理"
+    valid_dispositions = [BATCH_DISPOSITION_MAPPING, BATCH_DISPOSITION_DRAFT, BATCH_DISPOSITION_REJECT]
+    if disposition not in valid_dispositions:
+        return None, f"无效的去向：{disposition}"
+    batch.disposition = disposition
+    batch.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    self.save_validation_batches()
+
+    snapshot = self.get_validation_snapshot(batch.snapshot_id)
+    if snapshot:
+        snapshot.disposition = disposition
+        self.save_validation_snapshots()
+
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_BATCH_DISPOSITION,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"批次处理：{batch.source_file} → {disposition}",
+        detail=f"批次ID={batch_id}",
+    )
+
+    if disposition == BATCH_DISPOSITION_DRAFT:
+        if snapshot and snapshot.precheck_result:
+            self.execute_import_to_drafts(
+                snapshot.precheck_result, operator, user_role
+            )
+
+    return batch, ""
+
+
+DataManager.set_batch_disposition = set_batch_disposition
+
+
+# ---- Batch Revoke / Restore (Admin only) ----
+
+def revoke_validation_batch(self, batch_id: str, operator: str, user_role: UserRole,
+                             reason: str) -> Tuple[Optional[ValidationBatch], str]:
+    if user_role != UserRole.ADMIN:
+        return None, "仅管理员可撤销批次导入"
+    batch = self.get_validation_batch(batch_id)
+    if not batch:
+        return None, "批次不存在"
+    if batch.is_revoked:
+        return None, "该批次已被撤销"
+    batch.is_revoked = True
+    batch.revoked_by = operator
+    batch.revoked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    batch.revoke_reason = reason
+    batch.updated_at = batch.revoked_at
+    self.save_validation_batches()
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_BATCH_REVOKE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"撤销批次：{batch.source_file}",
+        detail=f"批次ID={batch_id}, 原因={reason}",
+    )
+    return batch, ""
+
+
+def restore_validation_snapshot(self, snapshot_id: str, operator: str,
+                                 user_role: UserRole) -> Tuple[Optional[ValidationBatch], str]:
+    if user_role != UserRole.ADMIN:
+        return None, "仅管理员可恢复快照"
+    snapshot = self.get_validation_snapshot(snapshot_id)
+    if not snapshot:
+        return None, "快照不存在"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_batch_id = str(uuid.uuid4())
+    new_snapshot_id = str(uuid.uuid4())
+
+    new_snapshot = ValidationSnapshot(
+        id=new_snapshot_id,
+        batch_id=new_batch_id,
+        snapshot_time=now,
+        source_file=snapshot.source_file,
+        file_encoding=snapshot.file_encoding,
+        scheme_id=snapshot.scheme_id,
+        scheme_name=snapshot.scheme_name,
+        raw_headers=list(snapshot.raw_headers),
+        raw_rows=[dict(r) for r in snapshot.raw_rows],
+        precheck_result=snapshot.precheck_result,
+        disposition=BATCH_DISPOSITION_PENDING,
+        operator=operator,
+    )
+    self.validation_snapshots.insert(0, new_snapshot)
+    self.save_validation_snapshots()
+
+    precheck = snapshot.precheck_result
+    new_batch = ValidationBatch(
+        id=new_batch_id,
+        source_file=snapshot.source_file,
+        file_encoding=snapshot.file_encoding,
+        operator=operator,
+        operator_role=user_role.value,
+        mapping_scheme_id=snapshot.scheme_id,
+        mapping_scheme_name=snapshot.scheme_name,
+        validation_scheme_id="",
+        validation_scheme_name="",
+        total_rows=precheck.total_rows if precheck else 0,
+        pass_rows=precheck.pass_rows if precheck else 0,
+        fail_rows=precheck.fail_rows if precheck else 0,
+        issues=precheck.issues if precheck else [],
+        disposition=BATCH_DISPOSITION_PENDING,
+        snapshot_id=new_snapshot_id,
+        created_at=now,
+        updated_at=now,
+    )
+    self.validation_batches.insert(0, new_batch)
+    self.save_validation_batches()
+
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_BATCH_RESTORE,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"从快照恢复批次：{snapshot.source_file}",
+        detail=f"新批次ID={new_batch_id}, 来源快照ID={snapshot_id}",
+    )
+    return new_batch, ""
+
+
+def rerun_validation_batch(self, batch_id: str, operator: str,
+                            user_role: UserRole, mapping_scheme: ImportMappingScheme,
+                            validation_scheme: Optional[ImportValidationScheme] = None,
+                            file_encoding: str = "auto"
+                            ) -> Tuple[Optional[ValidationBatch], str]:
+    batch = self.get_validation_batch(batch_id)
+    if not batch:
+        return None, "批次不存在"
+    if user_role != UserRole.ADMIN and batch.operator != operator:
+        return None, "无权复跑他人的批次"
+    snapshot = self.get_validation_snapshot(batch.snapshot_id)
+    if not snapshot:
+        return None, "批次关联的快照不存在"
+    filepath = snapshot.source_file
+    if not os.path.exists(filepath):
+        return None, f"源文件已不存在：{filepath}"
+    self._add_operation_log(
+        operation_type=OperationType.VALIDATION_BATCH_RERUN,
+        operator=operator,
+        operator_role=user_role.value,
+        description=f"复跑批次：{batch.source_file}",
+        detail=f"原批次ID={batch_id}",
+    )
+    return self.run_validation_workbench(filepath, mapping_scheme, validation_scheme, file_encoding)
+
+
+DataManager.revoke_validation_batch = revoke_validation_batch
+DataManager.restore_validation_snapshot = restore_validation_snapshot
+DataManager.rerun_validation_batch = rerun_validation_batch
+
+
+# ---- Export Failed/Passed Rows ----
+
+def export_validation_failed_rows(self, batch: ValidationBatch, filepath: str) -> Tuple[bool, str]:
+    try:
+        fail_by_row: Dict[int, List[PrecheckIssue]] = {}
+        for issue in batch.issues:
+            if issue.row_number not in fail_by_row:
+                fail_by_row[issue.row_number] = []
+            fail_by_row[issue.row_number].append(issue)
+        export_dir = os.path.dirname(filepath)
+        if export_dir:
+            self.set_last_export_dir(export_dir)
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["行号", "问题类型", "关联列", "详细说明", "原始数据"])
+            for rn in sorted(fail_by_row.keys()):
+                for issue in fail_by_row[rn]:
+                    raw_str = json.dumps(issue.raw_row, ensure_ascii=False) if issue.raw_row else ""
+                    writer.writerow([
+                        rn,
+                        issue.issue_type,
+                        issue.column_name,
+                        issue.detail,
+                        raw_str,
+                    ])
+        self._add_operation_log(
+            operation_type=OperationType.VALIDATION_BATCH_EXPORT_FAIL,
+            operator=self.settings.current_user,
+            operator_role=self.settings.current_role.value,
+            description=f"导出批次失败行：{batch.source_file}",
+            detail=f"批次ID={batch.id}, 文件={filepath}, 失败行={len(fail_by_row)}",
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def export_validation_passed_rows(self, batch: ValidationBatch, filepath: str) -> Tuple[bool, str]:
+    try:
+        snapshot = self.get_validation_snapshot(batch.snapshot_id)
+        if not snapshot or not snapshot.precheck_result:
+            return False, "批次快照或预检结果不存在"
+        export_dir = os.path.dirname(filepath)
+        if export_dir:
+            self.set_last_export_dir(export_dir)
+        standard_rows = snapshot.precheck_result.standard_rows
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["仪器编号", "申请人", "开始时间", "结束时间", "用途"])
+            for srow in standard_rows:
+                writer.writerow([
+                    srow.get("instrument_code", ""),
+                    srow.get("applicant", ""),
+                    srow.get("start_time", ""),
+                    srow.get("end_time", ""),
+                    srow.get("purpose", ""),
+                ])
+        self._add_operation_log(
+            operation_type=OperationType.VALIDATION_BATCH_EXPORT_PASS,
+            operator=self.settings.current_user,
+            operator_role=self.settings.current_role.value,
+            description=f"导出批次通过行：{batch.source_file}",
+            detail=f"批次ID={batch.id}, 文件={filepath}, 通过行={len(standard_rows)}",
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+DataManager.export_validation_failed_rows = export_validation_failed_rows
+DataManager.export_validation_passed_rows = export_validation_passed_rows
