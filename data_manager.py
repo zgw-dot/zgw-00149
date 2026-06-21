@@ -355,6 +355,7 @@ class OperationLogEntry:
 @dataclass
 class AppSettings:
     export_dir: str = ""
+    import_dir: str = ""
     filter_person: str = ""
     filter_status: str = ""
     ins_filter_person: str = ""
@@ -364,6 +365,7 @@ class AppSettings:
     reminder_enabled: bool = True
     default_reminder_minutes: int = 30
     last_import_result: Optional[ImportResult] = None
+    last_template_snapshots: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self):
         d = asdict(self)
@@ -379,6 +381,7 @@ class AppSettings:
             last_imp = ImportResult.from_dict(d["last_import_result"])
         return cls(
             export_dir=d.get("export_dir", ""),
+            import_dir=d.get("import_dir", ""),
             filter_person=d.get("filter_person", ""),
             filter_status=d.get("filter_status", ""),
             ins_filter_person=d.get("ins_filter_person", ""),
@@ -388,6 +391,7 @@ class AppSettings:
             reminder_enabled=d.get("reminder_enabled", True),
             default_reminder_minutes=d.get("default_reminder_minutes", 30),
             last_import_result=last_imp,
+            last_template_snapshots=d.get("last_template_snapshots", []),
         )
 
 
@@ -1007,6 +1011,34 @@ class DataManager:
         results.sort(key=lambda t: t.updated_at, reverse=True)
         return results
 
+    def save_template_snapshots(self, template_ids: List[str]):
+        snapshots = []
+        for tid in template_ids:
+            tpl = self.get_template(tid)
+            if tpl:
+                snap = {
+                    "template_id": tpl.id,
+                    "template_name": tpl.name,
+                    "instrument_code": tpl.instrument_code,
+                    "instrument_model": tpl.instrument_model,
+                    "purpose": tpl.purpose,
+                    "default_duration_minutes": tpl.default_duration_minutes,
+                    "reminder_minutes": tpl.reminder_minutes,
+                    "remark": tpl.remark,
+                    "applicable_persons": list(tpl.applicable_persons),
+                    "time_slots": [ts.to_dict() for ts in tpl.time_slots],
+                    "snapshot_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "instrument_id": tpl.instrument_id,
+                    "created_at": tpl.created_at,
+                    "updated_at": tpl.updated_at,
+                }
+                snapshots.append(snap)
+        self.settings.last_template_snapshots = snapshots
+        self.save_settings()
+
+    def get_last_template_snapshots(self) -> List[Dict[str, Any]]:
+        return self.settings.last_template_snapshots or []
+
     def apply_template(self, template_id: str, start_date: str = None,
                        time_slot_index: int = 0,
                        applicant: str = None) -> Tuple[Optional[Reservation], str]:
@@ -1223,6 +1255,7 @@ class DataManager:
         except Exception as e:
             result.errors.append(f"导入失败：{str(e)}")
 
+        self.save_template_snapshots(result.imported_template_ids)
         self.settings.last_import_result = result
         self.save_settings()
 
@@ -1391,6 +1424,7 @@ class DataManager:
         except Exception as e:
             result.errors.append(f"导入失败：{str(e)}")
 
+        self.save_template_snapshots(result.imported_template_ids)
         self.settings.last_import_result = result
         self.save_settings()
 

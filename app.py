@@ -661,9 +661,12 @@ class TemplateManagementDialog(tk.Toplevel):
             messagebox.showerror("权限不足", "仅管理员可导入模板", parent=self)
             return
 
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
         filepath = filedialog.askopenfilename(
             title="导入模板JSON",
+            initialdir=initial_dir,
             filetypes=[("JSON 文件", "*.json")],
+            parent=self,
         )
         if not filepath:
             return
@@ -677,6 +680,8 @@ class TemplateManagementDialog(tk.Toplevel):
         result = self.dm.import_templates_json(
             filepath, overwrite=overwrite, user_role=self.dm.settings.current_role
         )
+        self.dm.settings.import_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
         self._show_import_result(result)
         self._refresh()
 
@@ -685,9 +690,12 @@ class TemplateManagementDialog(tk.Toplevel):
             messagebox.showerror("权限不足", "仅管理员可导入模板", parent=self)
             return
 
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
         filepath = filedialog.askopenfilename(
             title="导入模板CSV",
+            initialdir=initial_dir,
             filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
         )
         if not filepath:
             return
@@ -701,6 +709,8 @@ class TemplateManagementDialog(tk.Toplevel):
         result = self.dm.import_templates_csv(
             filepath, overwrite=overwrite, user_role=self.dm.settings.current_role
         )
+        self.dm.settings.import_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
         self._show_import_result(result)
         self._refresh()
 
@@ -1707,9 +1717,9 @@ class App:
         style.configure("Header.TLabel", font=("Arial", 11, "bold"))
 
     def _build_menu(self):
-        menubar = tk.Menu(self.root)
+        self.menubar = tk.Menu(self.root)
 
-        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu = tk.Menu(self.menubar, tearoff=0)
         file_menu.add_command(label="导出预约 (CSV)", command=lambda: self._export("csv"))
         file_menu.add_command(label="导出预约 (JSON)", command=lambda: self._export("json"))
         file_menu.add_command(label="导出仪器档案 (CSV)", command=self._export_instruments)
@@ -1718,22 +1728,25 @@ class App:
         file_menu.add_command(label="查看操作日志", command=self._show_operation_logs)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self._on_close)
-        menubar.add_cascade(label="文件", menu=file_menu)
+        self.menubar.add_cascade(label="文件", menu=file_menu)
 
-        template_menu = tk.Menu(menubar, tearoff=0)
-        template_menu.add_command(label="模板管理", command=self._show_template_management)
-        template_menu.add_command(label="导入模板 (JSON)", command=self._import_templates_json)
-        template_menu.add_command(label="导入模板 (CSV)", command=self._import_templates_csv)
-        template_menu.add_command(label="导出模板 (JSON)", command=self._export_templates_json)
-        template_menu.add_command(label="导出模板 (CSV)", command=self._export_templates_csv)
-        menubar.add_cascade(label="模板", menu=template_menu)
+        self.template_menu = tk.Menu(self.menubar, tearoff=0)
+        self.template_menu.add_command(label="模板管理", command=self._show_template_management)
+        self.template_menu.add_command(label="导入模板 (JSON)", command=self._import_templates_json)
+        self.template_menu.add_command(label="导入模板 (CSV)", command=self._import_templates_csv)
+        self.template_menu.add_separator()
+        self.template_menu.add_command(label="查看最近导入结果", command=self._show_last_import_result)
+        self.template_menu.add_separator()
+        self.template_menu.add_command(label="导出模板 (JSON)", command=self._export_templates_json)
+        self.template_menu.add_command(label="导出模板 (CSV)", command=self._export_templates_csv)
+        self.menubar.add_cascade(label="模板", menu=self.template_menu)
 
-        batch_menu = tk.Menu(menubar, tearoff=0)
-        batch_menu.add_command(label="批量创建预约", command=self._show_batch_create)
-        batch_menu.add_command(label="批量操作记录", command=self._show_batch_management)
-        menubar.add_cascade(label="批量操作", menu=batch_menu)
+        self.batch_menu = tk.Menu(self.menubar, tearoff=0)
+        self.batch_menu.add_command(label="批量创建预约", command=self._show_batch_create)
+        self.batch_menu.add_command(label="批量操作记录", command=self._show_batch_management)
+        self.menubar.add_cascade(label="批量操作", menu=self.batch_menu)
 
-        role_menu = tk.Menu(menubar, tearoff=0)
+        role_menu = tk.Menu(self.menubar, tearoff=0)
         self.role_var = tk.StringVar(value=self.dm.settings.current_role.value)
         role_menu.add_radiobutton(
             label="普通用户", variable=self.role_var, value="普通用户", command=self._on_role_change
@@ -1741,21 +1754,22 @@ class App:
         role_menu.add_radiobutton(
             label="管理员", variable=self.role_var, value="管理员", command=self._on_role_change
         )
-        menubar.add_cascade(label="角色", menu=role_menu)
+        self.menubar.add_cascade(label="角色", menu=role_menu)
 
-        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu = tk.Menu(self.menubar, tearoff=0)
         self.reminder_enabled_var = tk.BooleanVar(value=self.dm.settings.reminder_enabled)
         settings_menu.add_checkbutton(
             label="启用提醒", variable=self.reminder_enabled_var, command=self._on_reminder_toggle
         )
         settings_menu.add_command(label="默认提醒时长...", command=self._set_default_reminder)
-        menubar.add_cascade(label="设置", menu=settings_menu)
+        self.menubar.add_cascade(label="设置", menu=settings_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu = tk.Menu(self.menubar, tearoff=0)
         help_menu.add_command(label="关于", command=self._show_about)
-        menubar.add_cascade(label="帮助", menu=help_menu)
+        self.menubar.add_cascade(label="帮助", menu=help_menu)
 
-        self.root.config(menu=menubar)
+        self.root.config(menu=self.menubar)
+        self._update_menu_permissions()
 
     def _build_ui(self):
         main_paned = ttk.PanedWindow(self.root, orient="horizontal")
@@ -2088,6 +2102,57 @@ class App:
             text=f"当前用户：{self.dm.settings.current_user} | 角色：{role_str}"
         )
         self._update_action_buttons()
+        self._update_menu_permissions()
+
+    def _update_menu_permissions(self):
+        is_admin = self.dm.settings.current_role == UserRole.ADMIN
+        import_json_idx = 1
+        import_csv_idx = 2
+        show_last_idx = 4
+        try:
+            if is_admin:
+                self.template_menu.entryconfig(import_json_idx, state="normal")
+                self.template_menu.entryconfig(import_csv_idx, state="normal")
+                self.template_menu.entryconfig(show_last_idx, state="normal")
+            else:
+                self.template_menu.entryconfig(import_json_idx, state="disabled")
+                self.template_menu.entryconfig(import_csv_idx, state="disabled")
+                self.template_menu.entryconfig(show_last_idx, state="disabled")
+        except tk.TclError:
+            pass
+
+    def _show_last_import_result(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可查看导入结果", parent=self.root)
+            return
+
+        result = self.dm.settings.last_import_result
+        if not result:
+            messagebox.showinfo("最近导入结果", "暂无导入记录", parent=self.root)
+            return
+
+        msg = f"最近一次导入时间：{result.timestamp}\n\n"
+        msg += f"总计：{result.total_count} 条\n"
+        msg += f"成功：{result.success_count} 条\n"
+        msg += f"失败：{result.failed_count} 条\n"
+        msg += f"整体状态：{'全部成功' if result.success else '存在错误'}\n"
+        if result.imported_template_ids:
+            msg += f"\n导入的模板ID：\n" + "\n".join(
+                [f"  - {tid}" for tid in result.imported_template_ids[:10]]
+            )
+            if len(result.imported_template_ids) > 10:
+                msg += f"\n  ... 共 {len(result.imported_template_ids)} 个"
+        if result.errors:
+            msg += "\n\n错误详情：\n" + "\n".join(
+                [f"  × {e}" for e in result.errors[:15]]
+            )
+            if len(result.errors) > 15:
+                msg += f"\n  ... 还有 {len(result.errors) - 15} 条错误"
+        if result.warnings:
+            msg += "\n\n警告：\n" + "\n".join(
+                [f"  ! {w}" for w in result.warnings[:10]]
+            )
+        messagebox.showinfo("最近一次导入结果", msg, parent=self.root)
 
     def _new_reservation(self):
         ins = self._get_selected_instrument()
