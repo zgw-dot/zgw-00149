@@ -3386,16 +3386,16 @@ class DataManager:
     # ===== Execute Import to Drafts / Sandbox =====
 
     def execute_import_to_drafts(self, precheck: PrecheckResult, operator: str,
-                                  user_role: UserRole) -> Tuple[int, List[str], List[str]]:
+                                  user_role: UserRole,
+                                  batch_id: str = None) -> Tuple[int, List[str], List[str]]:
         if not precheck or not precheck.standard_rows:
             return 0, [], ["无可导入的数据"]
-        if precheck.fail_rows > 0:
-            return 0, [], ["存在未通过预检的行，必须全部通过后才能导入"]
 
         created_ids: List[str] = []
         errors: List[str] = []
 
-        batch_id = str(uuid.uuid4())
+        if batch_id is None:
+            batch_id = str(uuid.uuid4())
         for idx, srow in enumerate(precheck.standard_rows):
             ins = self.get_instrument_by_code(srow["instrument_code"])
             if not ins:
@@ -3431,8 +3431,6 @@ class DataManager:
             return None, ["仅管理员可导入到沙盘"]
         if not precheck or not precheck.standard_rows:
             return None, ["无可导入的数据"]
-        if precheck.fail_rows > 0:
-            return None, ["存在未通过预检的行，必须全部通过后才能导入"]
 
         items = []
         for i, srow in enumerate(precheck.standard_rows):
@@ -3592,6 +3590,8 @@ class ValidationBatch:
     revoke_reason: Optional[str] = None
     created_at: str = ""
     updated_at: str = ""
+    reservation_ids: List[str] = field(default_factory=list)
+    disposition_executed: bool = False
 
     def to_dict(self):
         d = asdict(self)
@@ -3623,6 +3623,8 @@ class ValidationBatch:
             revoke_reason=d.get("revoke_reason"),
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
+            reservation_ids=d.get("reservation_ids", []),
+            disposition_executed=d.get("disposition_executed", False),
         )
 
 
@@ -4545,12 +4547,13 @@ def set_batch_disposition(self, batch_id: str, disposition: str, operator: str,
         return None, "无权处理他人的批次"
     if batch.is_revoked:
         return None, "该批次已被撤销，无法处理"
+    if batch.disposition_executed and batch.disposition == disposition:
+        return batch, "该批次已执行过此去向，不可重复执行"
     valid_dispositions = [BATCH_DISPOSITION_MAPPING, BATCH_DISPOSITION_DRAFT, BATCH_DISPOSITION_REJECT]
     if disposition not in valid_dispositions:
         return None, f"无效的去向：{disposition}"
     batch.disposition = disposition
     batch.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    self.save_validation_batches()
 
     snapshot = self.get_validation_snapshot(batch.snapshot_id)
     if snapshot:
@@ -4565,12 +4568,17 @@ def set_batch_disposition(self, batch_id: str, disposition: str, operator: str,
         detail=f"批次ID={batch_id}",
     )
 
-    if disposition == BATCH_DISPOSITION_DRAFT:
+    if disposition == BATCH_DISPOSITION_DRAFT and not batch.disposition_executed:
         if snapshot and snapshot.precheck_result:
-            self.execute_import_to_drafts(
-                snapshot.precheck_result, operator, user_role
+            count, created_ids, errors = self.execute_import_to_drafts(
+                snapshot.precheck_result, operator, user_role, batch_id=batch.id
             )
+            batch.reservation_ids = created_ids
+            batch.disposition_executed = True
+    elif disposition == BATCH_DISPOSITION_DRAFT:
+        pass
 
+    self.save_validation_batches()
     return batch, ""
 
 
@@ -4588,18 +4596,36 @@ def revoke_validation_batch(self, batch_id: str, operator: str, user_role: UserR
         return None, "批次不存在"
     if batch.is_revoked:
         return None, "该批次已被撤销"
+
+    cancelled_res_count = 0
+    for res_id in batch.reservation_ids:
+        res = next((r for r in self.reservations if r.id == res_id), None)
+        if res and res.status in (ReservationStatus.DRAFT, ReservationStatus.PENDING_CONFIRM):
+            res.status = ReservationStatus.CANCELLED
+            res.cancel_reason = f"批次撤销：{reason}"
+            res.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cancelled_res_count += 1
+    if cancelled_res_count > 0:
+        self.save_reservations()
+
     batch.is_revoked = True
     batch.revoked_by = operator
     batch.revoked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     batch.revoke_reason = reason
     batch.updated_at = batch.revoked_at
     self.save_validation_batches()
+
+    snapshot = self.get_validation_snapshot(batch.snapshot_id)
+    if snapshot:
+        snapshot.disposition = f"已撤销({reason})"
+        self.save_validation_snapshots()
+
     self._add_operation_log(
         operation_type=OperationType.VALIDATION_BATCH_REVOKE,
         operator=operator,
         operator_role=user_role.value,
-        description=f"撤销批次：{batch.source_file}",
-        detail=f"批次ID={batch_id}, 原因={reason}",
+        description=f"撤销批次：{batch.source_file}，清理预约{cancelled_res_count}条",
+        detail=f"批次ID={batch_id}, 原因={reason}, 清理预约数={cancelled_res_count}",
     )
     return batch, ""
 

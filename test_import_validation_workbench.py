@@ -368,20 +368,42 @@ def main():
         os.makedirs(tmp6)
         dm = setup_dm(tmp6, role=UserRole.ADMIN, user="admin01")
         mapping_scheme = create_default_mapping_scheme(dm, "映射6")
-        good_rows = create_good_rows(dm, 2)
-        csv_path = os.path.join(tmp6, "good.csv")
-        make_csv(csv_path, good_rows)
-
-        batch, err = dm.run_validation_workbench(
-            filepath=csv_path, mapping_scheme=mapping_scheme, file_encoding="utf-8-sig",
-        )
-        assert_eq(batch.disposition, BATCH_DISPOSITION_PENDING, "初始去向着为待处理")
 
         for disp in [BATCH_DISPOSITION_MAPPING, BATCH_DISPOSITION_DRAFT, BATCH_DISPOSITION_REJECT]:
+            good_rows = create_good_rows(dm, 2)
+            csv_path = os.path.join(tmp6, f"good_{disp[:2]}.csv")
+            make_csv(csv_path, good_rows)
+            batch, err = dm.run_validation_workbench(
+                filepath=csv_path, mapping_scheme=mapping_scheme, file_encoding="utf-8-sig",
+            )
+            assert_eq(batch.disposition, BATCH_DISPOSITION_PENDING, "初始去向为待处理")
             ok, msg = dm.set_batch_disposition(batch.id, disp, "admin01", UserRole.ADMIN)
             assert_true(ok, f"设置去向「{disp}」成功: {msg}")
             got = dm.get_validation_batch(batch.id)
             assert_eq(got.disposition, disp, f"批次去向更新为「{disp}」")
+            if disp == BATCH_DISPOSITION_DRAFT:
+                assert_true(got.disposition_executed, "存为草稿后 disposition_executed=True")
+                assert_eq(len(got.reservation_ids), 2, "存为草稿生成了2条预约")
+                for rid in got.reservation_ids:
+                    res = next((r for r in dm.reservations if r.id == rid), None)
+                    assert_true(res is not None, f"预约 {rid} 存在于系统中")
+                    assert_eq(res.status, ReservationStatus.DRAFT, f"预约 {rid} 是草稿状态")
+
+        # 重复执行同一去向应被拒绝
+        dm_dup = setup_dm(os.path.join(tmp_root, "t6_dup"), role=UserRole.ADMIN, user="admin01")
+        mapping_scheme_dup = create_default_mapping_scheme(dm_dup, "映射6dup")
+        good_rows_dup = create_good_rows(dm_dup, 2)
+        csv_dup = os.path.join(tmp_root, "t6_dup", "dup.csv")
+        make_csv(csv_dup, good_rows_dup)
+        b_dup, _ = dm_dup.run_validation_workbench(
+            filepath=csv_dup, mapping_scheme=mapping_scheme_dup, file_encoding="utf-8-sig",
+        )
+        ok1, _ = dm_dup.set_batch_disposition(b_dup.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        assert_true(ok1, "首次存为草稿成功")
+        ok2, msg2 = dm_dup.set_batch_disposition(b_dup.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        assert_true(ok2 is not None, "重复同一去向返回 batch 而非 None")
+        got_dup = dm_dup.get_validation_batch(b_dup.id)
+        assert_eq(len(got_dup.reservation_ids), 2, "重复执行不会重复创建预约")
 
         # ===== 测试7: 权限隔离 =====
         separator("测试7: 权限隔离（普通用户只能看自己的批次）")
@@ -449,14 +471,39 @@ def main():
         snapshot_id = batch.snapshot_id
         assert_true(snapshot_id is not None, "批次有快照")
 
-        # 撤销
+        ok, msg = dm.set_batch_disposition(batch.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        assert_true(ok, f"存为草稿成功: {msg}")
+        got_after_draft = dm.get_validation_batch(batch.id)
+        res_ids = got_after_draft.reservation_ids
+        assert_eq(len(res_ids), 2, "草稿前生成了2条预约")
+
+        for rid in res_ids:
+            res = next((r for r in dm.reservations if r.id == rid), None)
+            assert_true(res is not None, f"预约 {rid} 存在")
+            assert_eq(res.status, ReservationStatus.DRAFT, f"预约 {rid} 是草稿")
+
         ok, msg = dm.revoke_validation_batch(batch.id, "admin01", UserRole.ADMIN, "测试撤销")
         assert_true(ok, f"撤销批次成功: {msg}")
         got = dm.get_validation_batch(batch.id)
         assert_true(got.is_revoked, "批次已标记撤销")
         assert_eq(got.revoke_reason, "测试撤销", "撤销原因正确")
 
-        # 恢复快照
+        for rid in res_ids:
+            res = next((r for r in dm.reservations if r.id == rid), None)
+            assert_true(res is not None, f"撤销后预约 {rid} 仍在系统中")
+            assert_eq(res.status, ReservationStatus.CANCELLED, f"撤销后预约 {rid} 状态为已取消")
+
+        snap = dm.get_validation_snapshot(snapshot_id)
+        assert_true(snap is not None, "撤销后快照仍存在")
+        assert_true("已撤销" in snap.disposition, f"快照去向已更新为已撤销: {snap.disposition}")
+
+        revoke_logs = [log for log in dm.operation_logs
+                       if log.operation_type == "批次导入撤销"]
+        assert_true(len(revoke_logs) >= 1, "撤销操作记入了日志")
+        last_revoke = revoke_logs[-1]
+        assert_true("清理预约2条" in last_revoke.description or "清理预约 2" in last_revoke.description,
+                     f"撤销日志包含清理预约数: {last_revoke.description}")
+
         restored, msg = dm.restore_validation_snapshot(
             snapshot_id, "admin01", UserRole.ADMIN
         )
@@ -464,8 +511,10 @@ def main():
         assert_neq = restored.id != batch.id
         assert_true(assert_neq, "恢复后是新的批次ID")
         assert_eq(restored.total_rows, batch.total_rows, "恢复的批次行数相同")
+        assert_eq(restored.disposition, BATCH_DISPOSITION_PENDING, "恢复后去向为待处理")
+        assert_false(restored.is_revoked, "恢复的批次未撤销")
+        assert_false(restored.disposition_executed, "恢复的批次未执行过去向")
 
-        # 复跑批次
         rerun, msg = dm.rerun_validation_batch(
             batch_id=restored.id, operator="admin01", user_role=UserRole.ADMIN,
             mapping_scheme=mapping_scheme, file_encoding="utf-8-sig",
@@ -473,6 +522,126 @@ def main():
         assert_true(rerun is not None, f"批次复跑成功: {msg}")
         assert_true(rerun.id != restored.id, "复跑后是新的批次ID")
         assert_eq(rerun.pass_rows, restored.pass_rows, "复跑通过行数相同")
+
+        # ===== 测试8a: 混合批次存草稿只继续通过项 =====
+        separator("测试8a: 混合批次(2通过1失败)存草稿只为通过项生成预约")
+        tmp8a = os.path.join(tmp_root, "t8a_mixed_draft")
+        os.makedirs(tmp8a)
+        dm8a = setup_dm(tmp8a, role=UserRole.ADMIN, user="admin01")
+        mapping_scheme_8a = create_default_mapping_scheme(dm8a, "映射8a")
+        codes_8a = get_instrument_codes(dm8a, 2)
+        today_8a = date.today().strftime("%Y-%m-%d")
+        mixed_rows_8a = [
+            [codes_8a[0], "通过用户1", today_8a, "09:00:00", "10:00:00", "正常1"],
+            ["", "失败用户", today_8a, "11:00:00", "12:00:00", "空仪器编号"],
+            [codes_8a[1], "通过用户2", today_8a, "13:00:00", "14:00:00", "正常2"],
+        ]
+        csv_8a = os.path.join(tmp8a, "mixed.csv")
+        make_csv(csv_8a, mixed_rows_8a)
+
+        batch_8a, err_8a = dm8a.run_validation_workbench(
+            filepath=csv_8a, mapping_scheme=mapping_scheme_8a, file_encoding="utf-8-sig",
+        )
+        assert_true(batch_8a is not None, f"混合批次体检成功: {err_8a}")
+        assert_eq(batch_8a.pass_rows, 2, "2行通过")
+        assert_eq(batch_8a.fail_rows, 1, "1行失败")
+
+        ok_8a, msg_8a = dm8a.set_batch_disposition(batch_8a.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        assert_true(ok_8a, f"混合批次存草稿成功: {msg_8a}")
+        got_8a = dm8a.get_validation_batch(batch_8a.id)
+        assert_true(got_8a.disposition_executed, "混合批次草稿已执行")
+        assert_eq(len(got_8a.reservation_ids), 2, "只为2行通过项生成预约")
+
+        for rid in got_8a.reservation_ids:
+            res = next((r for r in dm8a.reservations if r.id == rid), None)
+            assert_true(res is not None, f"通过项预约 {rid} 存在")
+            assert_eq(res.status, ReservationStatus.DRAFT, f"预约 {rid} 是草稿状态")
+            assert_true(res.applicant != "失败用户", "失败用户的预约不应被创建")
+
+        # ===== 测试8b: 撤销后预约、批次状态、快照和日志一致 =====
+        separator("测试8b: 撤销全通过批次后预约清理+批次状态+快照+日志一致")
+        tmp8b = os.path.join(tmp_root, "t8b_revoke_consistency")
+        os.makedirs(tmp8b)
+        dm8b = setup_dm(tmp8b, role=UserRole.ADMIN, user="admin01")
+        mapping_scheme_8b = create_default_mapping_scheme(dm8b, "映射8b")
+        good_rows_8b = create_good_rows(dm8b, 3)
+        csv_8b = os.path.join(tmp8b, "full_pass.csv")
+        make_csv(csv_8b, good_rows_8b)
+
+        batch_8b, _ = dm8b.run_validation_workbench(
+            filepath=csv_8b, mapping_scheme=mapping_scheme_8b, file_encoding="utf-8-sig",
+        )
+        dm8b.set_batch_disposition(batch_8b.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        batch_8b_refreshed = dm8b.get_validation_batch(batch_8b.id)
+        assert_eq(len(batch_8b_refreshed.reservation_ids), 3, "3条预约已生成")
+
+        draft_count_before = sum(1 for r in dm8b.reservations if r.status == ReservationStatus.DRAFT)
+        assert_eq(draft_count_before, 3, "撤销前有3条草稿预约")
+
+        ok_8b, _ = dm8b.revoke_validation_batch(batch_8b.id, "admin01", UserRole.ADMIN, "一致性测试")
+        assert_true(ok_8b, "撤销成功")
+
+        got_8b = dm8b.get_validation_batch(batch_8b.id)
+        assert_true(got_8b.is_revoked, "批次已撤销")
+        assert_eq(got_8b.revoke_reason, "一致性测试", "撤销原因一致")
+
+        cancelled_count = sum(1 for r in dm8b.reservations if r.status == ReservationStatus.CANCELLED)
+        assert_eq(cancelled_count, 3, "3条预约均变为已取消")
+        draft_count_after = sum(1 for r in dm8b.reservations if r.status == ReservationStatus.DRAFT)
+        assert_eq(draft_count_after, 0, "撤销后没有残留的草稿预约")
+
+        snap_8b = dm8b.get_validation_snapshot(batch_8b.snapshot_id)
+        assert_true("已撤销" in snap_8b.disposition, "快照去向标记已撤销")
+
+        revoke_log_8b = [log for log in dm8b.operation_logs
+                         if log.operation_type == "批次导入撤销"][-1]
+        assert_true("3" in revoke_log_8b.description, f"撤销日志包含预约清理数: {revoke_log_8b.description}")
+
+        # ===== 测试8c: 恢复快照再复跑结果稳定 =====
+        separator("测试8c: 恢复快照再复跑结果稳定")
+        tmp8c = os.path.join(tmp_root, "t8c_snapshot_rerun")
+        os.makedirs(tmp8c)
+        dm8c = setup_dm(tmp8c, role=UserRole.ADMIN, user="admin01")
+        mapping_scheme_8c = create_default_mapping_scheme(dm8c, "映射8c")
+        good_rows_8c = create_good_rows(dm8c, 2)
+        csv_8c = os.path.join(tmp8c, "stable.csv")
+        make_csv(csv_8c, good_rows_8c)
+
+        batch_8c, _ = dm8c.run_validation_workbench(
+            filepath=csv_8c, mapping_scheme=mapping_scheme_8c, file_encoding="utf-8-sig",
+        )
+        original_pass = batch_8c.pass_rows
+        original_fail = batch_8c.fail_rows
+        original_total = batch_8c.total_rows
+        snap_8c_id = batch_8c.snapshot_id
+
+        dm8c.set_batch_disposition(batch_8c.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        dm8c.revoke_validation_batch(batch_8c.id, "admin01", UserRole.ADMIN, "准备恢复")
+
+        restored_8c, _ = dm8c.restore_validation_snapshot(snap_8c_id, "admin01", UserRole.ADMIN)
+        assert_true(restored_8c is not None, "快照恢复成功")
+        assert_eq(restored_8c.pass_rows, original_pass, "恢复后通过行数与原始一致")
+        assert_eq(restored_8c.fail_rows, original_fail, "恢复后失败行数与原始一致")
+
+        dm8c.set_batch_disposition(restored_8c.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        restored_after_draft = dm8c.get_validation_batch(restored_8c.id)
+        assert_eq(len(restored_after_draft.reservation_ids), original_pass,
+                  "恢复后再存草稿预约数等于通过行数")
+
+        dm8c.revoke_validation_batch(restored_8c.id, "admin01", UserRole.ADMIN, "撤销后准备复跑")
+
+        rerun_8c, _ = dm8c.rerun_validation_batch(
+            batch_id=restored_8c.id, operator="admin01", user_role=UserRole.ADMIN,
+            mapping_scheme=mapping_scheme_8c, file_encoding="utf-8-sig",
+        )
+        assert_true(rerun_8c is not None, "复跑成功")
+        assert_eq(rerun_8c.pass_rows, original_pass, "复跑通过行数稳定")
+        assert_eq(rerun_8c.total_rows, original_total, "复跑总行数稳定")
+
+        dm8c.set_batch_disposition(rerun_8c.id, BATCH_DISPOSITION_DRAFT, "admin01", UserRole.ADMIN)
+        rerun_after_draft = dm8c.get_validation_batch(rerun_8c.id)
+        assert_eq(len(rerun_after_draft.reservation_ids), original_pass,
+                  "复跑后存草稿预约数与原始通过行数一致")
 
         # ===== 测试9: 重启后一致性 =====
         separator("测试9: 重启后数据一致性（批次、快照、方案、用户偏好）")

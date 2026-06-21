@@ -4386,7 +4386,11 @@ class ImportValidationWorkbenchDialog(tk.Toplevel):
             messagebox.showerror("操作失败", msg, parent=self)
             return
         self._refresh_batch_list()
-        messagebox.showinfo("成功", f"批次去向已设为「{disposition}」\n\n{msg}", parent=self)
+        res_info = ""
+        updated_batch = self.dm.get_validation_batch(self.current_batch.id)
+        if updated_batch and updated_batch.reservation_ids:
+            res_info = f"\n已生成预约：{len(updated_batch.reservation_ids)} 条"
+        messagebox.showinfo("成功", f"批次去向已设为「{disposition}」{res_info}", parent=self)
 
     # ==================== Tab3 Actions ====================
     def _refresh_batch_list(self):
@@ -4544,7 +4548,8 @@ class ImportValidationWorkbenchDialog(tk.Toplevel):
             messagebox.showerror("撤销失败", msg, parent=self)
             return
         self._refresh_batch_list()
-        messagebox.showinfo("成功", f"批次已撤销：{reason.strip()}", parent=self)
+        res_count = len(batch.reservation_ids) if hasattr(batch, 'reservation_ids') else 0
+        messagebox.showinfo("成功", f"批次已撤销：{reason.strip()}\n已清理预约：{res_count} 条", parent=self)
 
     # ==================== Session Restore ====================
     def _restore_session(self):
