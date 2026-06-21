@@ -6,7 +6,7 @@ from datetime import datetime, date, timedelta
 from data_manager import (
     DataManager, InstrumentStatus, ReservationStatus, UserRole,
     TimeSlot, STATUS_FLOW, OperationType, ReservationTemplate,
-    ImportResult, BatchRecord, TemplateSnapshot
+    ImportResult, BatchRecord, TemplateSnapshot, BatchItemResult
 )
 
 
@@ -1035,10 +1035,22 @@ class BatchCreateDialog(tk.Toplevel):
             self.conflicts = self.dm.check_batch_conflicts(self.batch_items)
             self._update_conflict_text()
 
-        if self.conflicts:
+        conflict_count = len(self.conflicts)
+        safe_count = len(self.batch_items) - conflict_count
+
+        if conflict_count > 0:
             if not messagebox.askyesno(
                 "确认创建",
-                f"检测到 {len(self.conflicts)} 个冲突，是否仍要创建？\n（有冲突的预约将自动跳过）",
+                f"检测到 {conflict_count} 个冲突项，这些项将被跳过（不会入库）。\n\n"
+                f"将仅创建 {safe_count} 条无冲突的预约。\n\n"
+                f"是否继续？",
+                parent=self
+            ):
+                return
+        else:
+            if not messagebox.askyesno(
+                "确认创建",
+                f"未检测到冲突，将创建 {safe_count} 条预约。\n\n是否继续？",
                 parent=self
             ):
                 return
@@ -1049,13 +1061,27 @@ class BatchCreateDialog(tk.Toplevel):
             user_role=self.dm.settings.current_role
         )
 
+        if record is None:
+            messagebox.showerror("创建失败", "批量创建返回空记录", parent=self)
+            return
+
         self.result_batch_id = record.id
 
+        skipped = getattr(record, "skipped_count", 0)
+        msg = (
+            f"批量创建完成！\n\n"
+            f"总数：{record.total_count}\n"
+            f"成功：{record.success_count} 个（已入库）\n"
+            f"跳过：{skipped} 个（冲突拦截，未入库）\n"
+            f"失败：{record.failed_count} 个"
+        )
         if fails:
-            msg = f"批量创建完成！\n\n成功：{record.success_count} 个\n失败：{record.failed_count} 个\n\n失败详情：\n" + "\n".join(fails[:10])
-            if len(fails) > 10:
-                msg += f"\n... 还有 {len(fails) - 10} 条失败记录"
-            messagebox.showwarning("部分失败", msg, parent=self)
+            msg += "\n\n详细信息：\n" + "\n".join(fails[:15])
+            if len(fails) > 15:
+                msg += f"\n... 还有 {len(fails) - 15} 条"
+
+        if record.failed_count > 0 or skipped > 0:
+            messagebox.showwarning("部分跳过/失败", msg, parent=self)
         else:
             messagebox.showinfo(
                 "创建成功",
@@ -1075,8 +1101,9 @@ class BatchManagementDialog(tk.Toplevel):
         super().__init__(parent)
         self.dm = dm
         self.title("批量操作记录")
-        self.geometry("900x560")
-        self.resizable(False, False)
+        self.geometry("1020x700")
+        self.minsize(900, 600)
+        self.resizable(True, True)
         self.transient(parent)
         self.grab_set()
 
@@ -1086,11 +1113,11 @@ class BatchManagementDialog(tk.Toplevel):
     def _build_ui(self):
         padding = {"padx": 8, "pady": 5}
 
-        frm = ttk.Frame(self, padding=15)
+        frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
 
         filter_frame = ttk.LabelFrame(frm, text="筛选", padding=10)
-        filter_frame.pack(fill="x", pady=(0, 10))
+        filter_frame.pack(fill="x", pady=(0, 8))
 
         ttk.Label(filter_frame, text="操作类型：").grid(row=0, column=0, **padding)
         self.operation_var = tk.StringVar()
@@ -1105,13 +1132,30 @@ class BatchManagementDialog(tk.Toplevel):
             row=0, column=2, padx=20
         )
 
-        columns = ("operation", "operator", "total", "success", "failed",
+        ttk.Label(filter_frame, text="筛选明细：").grid(row=0, column=3, sticky="e", **padding)
+        self.detail_filter_var = tk.StringVar(value="全部")
+        self.detail_filter_combo = ttk.Combobox(
+            filter_frame, textvariable=self.detail_filter_var,
+            values=["全部", "成功", "跳过", "失败"],
+            state="readonly", width=10
+        )
+        self.detail_filter_combo.grid(row=0, column=4, **padding)
+        self.detail_filter_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_detail_tree())
+
+        ttk.Label(filter_frame, text="（下方明细表格按此筛选）",
+                  foreground="gray").grid(row=0, column=5, sticky="w", padx=5)
+
+        records_frame = ttk.LabelFrame(frm, text="批次记录（点击下方查看明细）", padding=8)
+        records_frame.pack(fill="both", expand=False, pady=(0, 8))
+
+        columns = ("operation", "operator", "total", "success", "skipped", "failed",
                    "created_at", "is_cancelled", "cancel_operator", "cancel_time")
-        self.record_tree = ttk.Treeview(frm, columns=columns, show="headings", height=15)
+        self.record_tree = ttk.Treeview(records_frame, columns=columns, show="headings", height=6)
         self.record_tree.heading("operation", text="操作类型")
         self.record_tree.heading("operator", text="操作人")
         self.record_tree.heading("total", text="总数")
         self.record_tree.heading("success", text="成功")
+        self.record_tree.heading("skipped", text="跳过")
         self.record_tree.heading("failed", text="失败")
         self.record_tree.heading("created_at", text="创建时间")
         self.record_tree.heading("is_cancelled", text="状态")
@@ -1120,34 +1164,70 @@ class BatchManagementDialog(tk.Toplevel):
 
         self.record_tree.column("operation", width=80, anchor="w")
         self.record_tree.column("operator", width=80, anchor="w")
-        self.record_tree.column("total", width=50, anchor="center")
-        self.record_tree.column("success", width=50, anchor="center")
-        self.record_tree.column("failed", width=50, anchor="center")
-        self.record_tree.column("created_at", width=130, anchor="w")
-        self.record_tree.column("is_cancelled", width=70, anchor="center")
+        self.record_tree.column("total", width=45, anchor="center")
+        self.record_tree.column("success", width=45, anchor="center")
+        self.record_tree.column("skipped", width=45, anchor="center")
+        self.record_tree.column("failed", width=45, anchor="center")
+        self.record_tree.column("created_at", width=135, anchor="w")
+        self.record_tree.column("is_cancelled", width=60, anchor="center")
         self.record_tree.column("cancel_operator", width=80, anchor="w")
-        self.record_tree.column("cancel_time", width=130, anchor="w")
+        self.record_tree.column("cancel_time", width=135, anchor="w")
 
-        self.record_tree.pack(fill="both", expand=True, pady=(0, 10))
+        self.record_tree.pack(fill="x", pady=(0, 2))
         self.record_tree.bind("<<TreeviewSelect>>", self._on_select)
         self.record_tree.bind("<Double-1>", lambda e: self._show_details())
 
-        scrollbar = ttk.Scrollbar(frm, orient="vertical", command=self.record_tree.yview)
-        self.record_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar_r = ttk.Scrollbar(records_frame, orient="vertical", command=self.record_tree.yview)
+        self.record_tree.configure(yscrollcommand=scrollbar_r.set)
 
-        detail_frame = ttk.LabelFrame(frm, text="详情", padding=10)
-        detail_frame.pack(fill="x", pady=(0, 10))
+        detail_nb = ttk.LabelFrame(frm, text="明细 - 逐条结果（成功/跳过/失败）", padding=8)
+        detail_nb.pack(fill="both", expand=True, pady=(0, 8))
 
-        self.detail_text = tk.Text(detail_frame, height=4, width=80)
+        detail_columns = ("idx", "status", "template", "instrument", "start_time",
+                          "applicant", "reason")
+        self.detail_tree = ttk.Treeview(detail_nb, columns=detail_columns, show="headings", height=10)
+        self.detail_tree.heading("idx", text="序号")
+        self.detail_tree.heading("status", text="状态")
+        self.detail_tree.heading("template", text="模板")
+        self.detail_tree.heading("instrument", text="仪器")
+        self.detail_tree.heading("start_time", text="开始时间")
+        self.detail_tree.heading("applicant", text="申请人")
+        self.detail_tree.heading("reason", text="原因/快照提示")
+
+        self.detail_tree.column("idx", width=50, anchor="center")
+        self.detail_tree.column("status", width=60, anchor="center")
+        self.detail_tree.column("template", width=140, anchor="w")
+        self.detail_tree.column("instrument", width=90, anchor="w")
+        self.detail_tree.column("start_time", width=140, anchor="w")
+        self.detail_tree.column("applicant", width=80, anchor="w")
+        self.detail_tree.column("reason", width=380, anchor="w")
+
+        self.detail_tree.pack(side="left", fill="both", expand=True, pady=(0, 2))
+        self.detail_tree.bind("<<TreeviewSelect>>", self._on_detail_select)
+        self.detail_tree.bind("<Double-1>", lambda e: self._show_item_detail())
+
+        vsb_d = ttk.Scrollbar(detail_nb, orient="vertical", command=self.detail_tree.yview)
+        self.detail_tree.configure(yscrollcommand=vsb_d.set)
+        vsb_d.pack(side="right", fill="y")
+
+        self.detail_tree.tag_configure("success", foreground="#2e7d32")
+        self.detail_tree.tag_configure("skipped", foreground="#e65100")
+        self.detail_tree.tag_configure("failed", foreground="#c62828")
+
+        info_frame = ttk.LabelFrame(frm, text="详情 / 模板快照 / 操作日志", padding=8)
+        info_frame.pack(fill="x", pady=(0, 8))
+
+        self.detail_text = tk.Text(info_frame, height=6, wrap="word")
         self.detail_text.pack(fill="x")
         self.detail_text.configure(state="disabled")
 
         btn_frame = ttk.Frame(frm)
         btn_frame.pack(fill="x")
 
-        ttk.Button(btn_frame, text="查看详情", command=self._show_details, width=12).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="查看批次详情", command=self._show_details, width=14).pack(side="left", padx=3)
+        ttk.Button(btn_frame, text="查看选中条目快照", command=self._show_item_detail, width=18).pack(side="left", padx=3)
         self.btn_cancel = ttk.Button(
-            btn_frame, text="整批撤销", command=self._cancel_batch, width=12,
+            btn_frame, text="整批撤销", command=self._cancel_batch, width=14,
             state="disabled"
         )
         self.btn_cancel.pack(side="left", padx=3)
@@ -1155,6 +1235,7 @@ class BatchManagementDialog(tk.Toplevel):
         if self.dm.settings.current_role != UserRole.ADMIN:
             self.btn_cancel.config(text="（需管理员）", state="disabled")
 
+        ttk.Button(btn_frame, text="导出批次备份(JSON)", command=self._export_batch_backup, width=20).pack(side="left", padx=3)
         ttk.Button(btn_frame, text="关闭", command=self.destroy, width=12).pack(side="right", padx=3)
 
     def _refresh_records(self):
@@ -1168,12 +1249,13 @@ class BatchManagementDialog(tk.Toplevel):
             status_text = "已撤销" if r.is_cancelled else "正常"
             cancel_op = r.cancel_operator if r.cancel_operator else ""
             cancel_time = r.cancel_time if r.cancel_time else ""
+            skipped = getattr(r, "skipped_count", 0)
             tag = "cancelled" if r.is_cancelled else ""
 
             self.record_tree.insert(
                 "", "end", iid=r.id,
                 values=(r.operation, r.operator, r.total_count,
-                        r.success_count, r.failed_count, r.created_at,
+                        r.success_count, skipped, r.failed_count, r.created_at,
                         status_text, cancel_op, cancel_time),
                 tags=(tag,)
             )
@@ -1191,11 +1273,25 @@ class BatchManagementDialog(tk.Toplevel):
             record = self.dm.get_batch_record(batch_id)
             if record:
                 detail = f"批次ID: {record.id}\n"
-                detail += f"操作人角色: {record.operator_role}\n"
+                detail += f"操作类型: {record.operation}\n"
+                detail += f"操作人: {record.operator} ({record.operator_role})\n"
+                detail += f"创建时间: {record.created_at}\n"
+                skipped = getattr(record, "skipped_count", 0)
+                detail += (f"总数: {record.total_count}, "
+                           f"成功: {record.success_count}, "
+                           f"跳过: {skipped}, "
+                           f"失败: {record.failed_count}\n")
+                detail += f"关联预约ID: {', '.join(record.reservation_ids[:8])}"
+                if len(record.reservation_ids) > 8:
+                    detail += f" 等{len(record.reservation_ids)}个"
+                detail += "\n"
                 if record.details:
-                    detail += f"详细信息:\n{record.details}"
-                if record.cancel_reason:
-                    detail += f"\n撤销原因: {record.cancel_reason}"
+                    detail += f"\n详细信息（前300字）:\n{record.details[:300]}"
+                    if len(record.details) > 300:
+                        detail += "..."
+                if record.is_cancelled:
+                    detail += f"\n\n【已撤销】\n撤销人: {record.cancel_operator}\n"
+                    detail += f"撤销时间: {record.cancel_time}\n撤销原因: {record.cancel_reason}"
                 self.detail_text.insert("end", detail)
 
                 can_cancel = (
@@ -1210,6 +1306,135 @@ class BatchManagementDialog(tk.Toplevel):
             self.btn_cancel.config(state="disabled")
 
         self.detail_text.configure(state="disabled")
+        self._refresh_detail_tree()
+
+    def _refresh_detail_tree(self):
+        for item in self.detail_tree.get_children():
+            self.detail_tree.delete(item)
+
+        selected = self.record_tree.selection()
+        if not selected:
+            return
+
+        batch_id = selected[0]
+        record = self.dm.get_batch_record(batch_id)
+        if not record:
+            return
+
+        item_results = getattr(record, "item_results", [])
+        if not item_results:
+            self.detail_tree.insert(
+                "", "end",
+                values=("-", "-", "（此批次无逐条明细，可能是旧版本数据）",
+                        "-", "-", "-", "请查看上方'详细信息'"),
+                tags=("skipped",)
+            )
+            return
+
+        filter_val = self.detail_filter_var.get()
+
+        for ir in item_results:
+            status = ir.status
+            if filter_val == "成功" and status != "success":
+                continue
+            if filter_val == "跳过" and status != "skipped":
+                continue
+            if filter_val == "失败" and status != "failed":
+                continue
+
+            status_display = "成功" if status == "success" else ("跳过" if status == "skipped" else "失败")
+            tag = status
+            reason_display = ir.reason if ir.reason else (
+                "（双击查看模板快照）" if ir.template_snapshot else "")
+            self.detail_tree.insert(
+                "", "end",
+                values=(
+                    ir.index + 1,
+                    status_display,
+                    ir.template_name or "-",
+                    ir.instrument_code or "-",
+                    ir.start_time or "-",
+                    ir.applicant or "-",
+                    reason_display,
+                ),
+                tags=(tag,)
+            )
+
+    def _on_detail_select(self, _=None):
+        pass
+
+    def _show_item_detail(self):
+        selected_detail = self.detail_tree.selection()
+        if not selected_detail:
+            messagebox.showinfo("提示", "请先在明细表格中选择一条记录", parent=self)
+            return
+
+        selected_batch = self.record_tree.selection()
+        if not selected_batch:
+            return
+
+        record = self.dm.get_batch_record(selected_batch[0])
+        if not record:
+            return
+
+        item_results = getattr(record, "item_results", [])
+        if not item_results:
+            messagebox.showinfo("提示", "该批次无逐条明细", parent=self)
+            return
+
+        idx_str = self.detail_tree.item(selected_detail[0], "values")[0]
+        try:
+            display_idx = int(idx_str)
+            target_ir = None
+            for ir in item_results:
+                if ir.index + 1 == display_idx:
+                    target_ir = ir
+                    break
+        except (ValueError, IndexError):
+            messagebox.showinfo("提示", "无法定位条目", parent=self)
+            return
+
+        if not target_ir:
+            messagebox.showinfo("提示", "未找到对应条目", parent=self)
+            return
+
+        snap = target_ir.template_snapshot
+        msg = f"第{target_ir.index + 1}条 明细\n"
+        msg += f"状态: {'成功' if target_ir.status == 'success' else ('跳过' if target_ir.status == 'skipped' else '失败')}\n"
+        msg += f"模板: {target_ir.template_name or '-'}\n"
+        msg += f"仪器: {target_ir.instrument_code or '-'}\n"
+        msg += f"开始时间: {target_ir.start_time or '-'}\n"
+        msg += f"申请人: {target_ir.applicant or '-'}\n"
+        msg += f"预约ID: {target_ir.reservation_id or '（无）'}\n"
+        if target_ir.reason:
+            msg += f"\n冲突/失败原因:\n{target_ir.reason}\n"
+
+        if snap:
+            msg += f"\n【模板快照】\n"
+            snap_name = ""
+            snap_time = ""
+            snap_purpose = ""
+            snap_duration = ""
+            snap_reminder = ""
+            snap_persons = ""
+            if isinstance(snap, dict):
+                snap_name = snap.get("template_name", "")
+                snap_time = snap.get("snapshot_time", "")
+                snap_purpose = snap.get("purpose", "")
+                snap_duration = snap.get("default_duration_minutes", "")
+                snap_reminder = snap.get("reminder_minutes", "")
+                persons = snap.get("applicable_persons", [])
+                snap_persons = ";".join(persons) if persons else "全部"
+            msg += f"模板名: {snap_name}\n"
+            msg += f"快照时间: {snap_time}\n"
+            msg += f"用途: {snap_purpose[:80]}{'...' if len(snap_purpose) > 80 else ''}\n"
+            msg += f"默认时长: {snap_duration}分钟\n"
+            msg += f"提前提醒: {snap_reminder}分钟\n"
+            msg += f"适用负责人: {snap_persons}"
+        elif target_ir.status == "success":
+            msg += "\n（该条成功记录未保存快照）"
+
+        messagebox.showinfo("条目详情 + 模板快照", msg, parent=self)
 
     def _show_details(self):
         selected = self.record_tree.selection()
@@ -1222,22 +1447,83 @@ class BatchManagementDialog(tk.Toplevel):
         if not record:
             return
 
+        skipped = getattr(record, "skipped_count", 0)
         detail = f"批次ID: {record.id}\n"
         detail += f"操作类型: {record.operation}\n"
         detail += f"操作人: {record.operator} ({record.operator_role})\n"
         detail += f"创建时间: {record.created_at}\n"
-        detail += f"总数: {record.total_count}, 成功: {record.success_count}, 失败: {record.failed_count}\n"
-        detail += f"关联预约ID: {', '.join(record.reservation_ids[:10])}"
-        if len(record.reservation_ids) > 10:
+        detail += (f"总数: {record.total_count}\n"
+                   f"成功: {record.success_count}（已入库）\n"
+                   f"跳过: {skipped}（冲突拦截，未入库）\n"
+                   f"失败: {record.failed_count}\n")
+        detail += f"关联预约ID: {', '.join(record.reservation_ids[:15])}"
+        if len(record.reservation_ids) > 15:
             detail += f" 等{len(record.reservation_ids)}个"
         detail += "\n"
         if record.details:
             detail += f"\n详细信息:\n{record.details}\n"
         if record.is_cancelled:
-            detail += f"\n已撤销\n撤销人: {record.cancel_operator}\n"
+            detail += f"\n【已撤销】\n撤销人: {record.cancel_operator}\n"
             detail += f"撤销时间: {record.cancel_time}\n撤销原因: {record.cancel_reason}"
 
         messagebox.showinfo("批次详情", detail, parent=self)
+
+    def _export_batch_backup(self):
+        selected = self.record_tree.selection()
+        if not selected:
+            if not messagebox.askyesno(
+                "导出全部",
+                "未选中具体批次，是否导出全部批次记录作为备份？",
+                parent=self
+            ):
+                return
+            records = self.dm.list_batch_records()
+            export_data = {
+                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "exported_by": self.dm.settings.current_user,
+                "role": self.dm.settings.current_role.value,
+                "batch_count": len(records),
+                "batches": [r.to_dict() for r in records],
+            }
+            default_name = f"全部批次备份_{date.today().strftime('%Y%m%d')}.json"
+        else:
+            batch_id = selected[0]
+            record = self.dm.get_batch_record(batch_id)
+            if not record:
+                return
+            export_data = {
+                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "exported_by": self.dm.settings.current_user,
+                "role": self.dm.settings.current_role.value,
+                "batch_count": 1,
+                "batches": [record.to_dict()],
+            }
+            default_name = f"批次备份_{record.id[:8]}_{date.today().strftime('%Y%m%d')}.json"
+
+        initial_dir = self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出批次备份(JSON)",
+            initialdir=initial_dir,
+            initialfile=default_name,
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json")],
+            parent=self,
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+            self.dm.settings.export_dir = os.path.dirname(filepath)
+            self.dm.save_settings()
+            messagebox.showinfo(
+                "导出成功",
+                f"批次备份已导出到：\n{filepath}\n\n包含 {export_data['batch_count']} 个批次记录（含逐条明细与模板快照）",
+                parent=self
+            )
+        except Exception as e:
+            messagebox.showerror("导出失败", f"导出过程出错：{str(e)}", parent=self)
 
     def _cancel_batch(self):
         selected = self.record_tree.selection()
@@ -1258,9 +1544,12 @@ class BatchManagementDialog(tk.Toplevel):
             messagebox.showwarning("提示", "该批次已被撤销", parent=self)
             return
 
+        skipped = getattr(record, "skipped_count", 0)
         reason = tk.simpledialog.askstring(
             "撤销原因",
-            f"确定要撤销该批次的 {len(record.reservation_ids)} 个预约吗？\n请填写撤销原因：",
+            f"确定要撤销该批次的 {len(record.reservation_ids)} 个已入库预约吗？\n\n"
+            f"（注：跳过的 {skipped} 条从未入库，无需处理）\n\n"
+            f"请填写撤销原因：",
             parent=self
         )
         if not reason or not reason.strip():

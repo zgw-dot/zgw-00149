@@ -287,6 +287,37 @@ class ImportResult:
 
 
 @dataclass
+class BatchItemResult:
+    index: int
+    status: str
+    template_name: str = ""
+    instrument_code: str = ""
+    start_time: str = ""
+    applicant: str = ""
+    reason: str = ""
+    reservation_id: str = ""
+    template_snapshot: Optional[Dict[str, Any]] = None
+
+    def to_dict(self):
+        d = asdict(self)
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            index=d.get("index", 0),
+            status=d.get("status", ""),
+            template_name=d.get("template_name", ""),
+            instrument_code=d.get("instrument_code", ""),
+            start_time=d.get("start_time", ""),
+            applicant=d.get("applicant", ""),
+            reason=d.get("reason", ""),
+            reservation_id=d.get("reservation_id", ""),
+            template_snapshot=d.get("template_snapshot"),
+        )
+
+
+@dataclass
 class BatchRecord:
     id: str
     operator: str
@@ -295,7 +326,9 @@ class BatchRecord:
     total_count: int
     success_count: int
     failed_count: int
+    skipped_count: int
     reservation_ids: List[str]
+    item_results: List[BatchItemResult]
     details: str
     created_at: str
     is_cancelled: bool = False
@@ -304,10 +337,13 @@ class BatchRecord:
     cancel_reason: Optional[str] = None
 
     def to_dict(self):
-        return asdict(self)
+        d = asdict(self)
+        d["item_results"] = [ir.to_dict() for ir in self.item_results]
+        return d
 
     @classmethod
     def from_dict(cls, d):
+        item_results = [BatchItemResult.from_dict(ir) for ir in d.get("item_results", [])]
         return cls(
             id=d["id"],
             operator=d["operator"],
@@ -315,8 +351,10 @@ class BatchRecord:
             operation=d["operation"],
             total_count=d["total_count"],
             success_count=d["success_count"],
-            failed_count=d["failed_count"],
+            failed_count=d.get("failed_count", 0),
+            skipped_count=d.get("skipped_count", 0),
             reservation_ids=d.get("reservation_ids", []),
+            item_results=item_results,
             details=d.get("details", ""),
             created_at=d["created_at"],
             is_cancelled=d.get("is_cancelled", False),
@@ -1133,6 +1171,23 @@ class DataManager:
         except Exception as e:
             return False, str(e)
 
+    def export_batch_records_json(self, filepath: str) -> Tuple[bool, str]:
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump([b.to_dict() for b in self.batch_records], f, ensure_ascii=False, indent=2)
+            self._add_operation_log(
+                operation_type=OperationType.BATCH_EXPORT.value
+                if hasattr(OperationType, "BATCH_EXPORT")
+                else OperationType.TEMPLATE_EXPORT.value,
+                operator=self.settings.current_user,
+                operator_role=self.settings.current_role.value,
+                description=f"导出批次记录：{len(self.batch_records)}个",
+                detail=f"文件={filepath}",
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
     def import_templates_json(self, filepath: str, overwrite: bool = False,
                                user_role: UserRole = None) -> ImportResult:
         result = ImportResult(
@@ -1561,10 +1616,21 @@ class DataManager:
         return conflicts
 
     def batch_create_reservations(self, batch_items: List[dict],
-                                   operator: str, user_role: UserRole) -> Tuple[BatchRecord, List[str]]:
+                                   operator: str, user_role: UserRole) -> Tuple[Optional[BatchRecord], List[str]]:
         batch_id = str(uuid.uuid4())
-        success_ids = []
-        fail_msgs = []
+        success_ids: List[str] = []
+        fail_msgs: List[str] = []
+        item_results: List[BatchItemResult] = []
+
+        conflicts = self.check_batch_conflicts(batch_items)
+        conflict_map: Dict[int, List[str]] = {}
+        for c in conflicts:
+            idx = c.get("index", 0)
+            ctype = c.get("type", "未知")
+            detail = c.get("detail", "")
+            if idx not in conflict_map:
+                conflict_map[idx] = []
+            conflict_map[idx].append(f"{ctype}: {detail}")
 
         for i, item in enumerate(batch_items):
             tpl_id = item.get("template_id")
@@ -1573,24 +1639,72 @@ class DataManager:
             applicant = item.get("applicant", operator)
 
             template = self.get_template(tpl_id)
-            if not template:
-                fail_msgs.append(f"第{i+1}项：模板不存在")
+            ins = None
+            ins_code = ""
+            tpl_name = ""
+            start_dt_str = ""
+            if template:
+                tpl_name = template.name
+                ins = self.get_instrument(template.instrument_id)
+                if ins:
+                    ins_code = ins.code
+                if template.time_slots and 0 <= slot_idx < len(template.time_slots):
+                    ts = template.time_slots[slot_idx]
+                    start_dt_str = f"{start_date} {ts.start_time}:00"
+
+            if i in conflict_map:
+                conflict_reasons = conflict_map[i]
+                all_reasons = "; ".join(conflict_reasons)
+                item_results.append(BatchItemResult(
+                    index=i,
+                    status="skipped",
+                    template_name=tpl_name,
+                    instrument_code=ins_code,
+                    start_time=start_dt_str,
+                    applicant=applicant,
+                    reason=all_reasons,
+                    reservation_id="",
+                    template_snapshot=None,
+                ))
+                fail_msgs.append(f"第{i+1}项（{tpl_name or '未知模板'}）因冲突被跳过: {all_reasons}")
                 continue
 
-            ins = self.get_instrument(template.instrument_id)
+            if not template:
+                reason = "模板不存在"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
+                continue
+
             if not ins:
-                fail_msgs.append(f"第{i+1}项：仪器不存在")
+                reason = "仪器不存在"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", template_name=tpl_name, reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
                 continue
 
             if ins.status == InstrumentStatus.MALFUNCTION_FROZEN:
-                fail_msgs.append(f"第{i+1}项：仪器{ins.code}故障冻结")
+                reason = f"仪器{ins_code}故障冻结"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", template_name=tpl_name,
+                    instrument_code=ins_code, reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
                 continue
+
             if ins.status == InstrumentStatus.CALIBRATION_EXPIRED:
-                fail_msgs.append(f"第{i+1}项：仪器{ins.code}校准过期")
+                reason = f"仪器{ins_code}校准过期"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", template_name=tpl_name,
+                    instrument_code=ins_code, reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
                 continue
 
             if not template.time_slots or slot_idx < 0 or slot_idx >= len(template.time_slots):
-                fail_msgs.append(f"第{i+1}项：时间段无效")
+                reason = "时间段无效"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", template_name=tpl_name,
+                    instrument_code=ins_code, reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
                 continue
 
             ts = template.time_slots[slot_idx]
@@ -1598,7 +1712,12 @@ class DataManager:
             try:
                 start_dt = datetime.strptime(start_dt_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
-                fail_msgs.append(f"第{i+1}项：日期格式错误")
+                reason = "日期格式错误"
+                item_results.append(BatchItemResult(
+                    index=i, status="failed", template_name=tpl_name,
+                    instrument_code=ins_code, start_time=start_dt_str,
+                    reason=reason, applicant=applicant))
+                fail_msgs.append(f"第{i+1}项：{reason}")
                 continue
 
             duration = timedelta(minutes=template.default_duration_minutes)
@@ -1606,6 +1725,7 @@ class DataManager:
             end_dt_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
             snapshot = template.create_snapshot()
+            snapshot_dict = snapshot.to_dict()
 
             res, msg = self.add_reservation(
                 instrument_id=template.instrument_id,
@@ -1619,8 +1739,32 @@ class DataManager:
             )
             if res:
                 success_ids.append(res.id)
+                item_results.append(BatchItemResult(
+                    index=i, status="success",
+                    template_name=tpl_name,
+                    instrument_code=ins_code,
+                    start_time=start_dt_str,
+                    applicant=applicant,
+                    reason="",
+                    reservation_id=res.id,
+                    template_snapshot=snapshot_dict,
+                ))
             else:
+                item_results.append(BatchItemResult(
+                    index=i, status="failed",
+                    template_name=tpl_name,
+                    instrument_code=ins_code,
+                    start_time=start_dt_str,
+                    applicant=applicant,
+                    reason=msg,
+                    reservation_id="",
+                    template_snapshot=None,
+                ))
                 fail_msgs.append(f"第{i+1}项：{msg}")
+
+        success_count = len(success_ids)
+        skipped_count = sum(1 for ir in item_results if ir.status == "skipped")
+        failed_count = sum(1 for ir in item_results if ir.status == "failed")
 
         record = BatchRecord(
             id=batch_id,
@@ -1628,9 +1772,11 @@ class DataManager:
             operator_role=user_role.value,
             operation=OperationType.BATCH_CREATE.value,
             total_count=len(batch_items),
-            success_count=len(success_ids),
-            failed_count=len(batch_items) - len(success_ids),
+            success_count=success_count,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
             reservation_ids=success_ids,
+            item_results=item_results,
             details="\n".join(fail_msgs) if fail_msgs else "",
             created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         )
@@ -1641,7 +1787,7 @@ class DataManager:
             operation_type=OperationType.BATCH_CREATE.value,
             operator=operator,
             operator_role=user_role.value,
-            description=f"批量建单：成功{len(success_ids)}个，失败{len(batch_items) - len(success_ids)}个",
+            description=f"批量建单：成功{success_count}个，跳过{skipped_count}个，失败{failed_count}个",
             detail=f"批次ID={batch_id}",
         )
 
