@@ -1,0 +1,29 @@
+[
+  {
+    "id": "440d2e11-bdf2-402f-bea6-aa21a83abc92",
+    "name": "GUI冒烟测试模板",
+    "instrument_id": "4717968d-a5df-4f90-ad4a-1aae8746a9fb",
+    "instrument_code": "INS-001",
+    "instrument_model": "高效液相色谱仪 HPLC-2025",
+    "purpose": "测试模板功能是否正常",
+    "default_duration_minutes": 90,
+    "reminder_minutes": 30,
+    "remark": "这是一个测试模板",
+    "applicable_persons": [
+      "张工",
+      "李工"
+    ],
+    "time_slots": [
+      {
+        "start_time": "09:00",
+        "end_time": "11:00"
+      },
+      {
+        "start_time": "14:00",
+        "end_time": "16:00"
+      }
+    ],
+    "created_at": "2026-06-21 11:18:46",
+    "updated_at": "2026-06-21 11:18:46"
+  }
+]

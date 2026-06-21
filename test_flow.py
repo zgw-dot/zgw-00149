@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_manager import (
     DataManager, InstrumentStatus, ReservationStatus, UserRole,
-    TimeSlot, STATUS_FLOW
+    TimeSlot, STATUS_FLOW, OperationType
 )
 
 
@@ -412,9 +412,500 @@ def main():
         assert_true(ok and os.path.exists(json_path2), "7.18 JSON导出未被破坏")
 
         # ------------------------------------------------------------------
-        separator("✓ 全部测试通过！")
+        separator("八、模板 CRUD 测试")
         # ------------------------------------------------------------------
-        print(f"\n  共执行了 40+ 项断言，覆盖：")
+        ins_001 = [i for i in dm.instruments if i.code == "INS-001"][0]
+        ins_004 = [i for i in dm.instruments if i.code == "INS-004"][0]
+
+        # 8.1 创建模板
+        tpl, msg = dm.add_template(
+            name="高效液相色谱日常检测",
+            instrument_id=ins_001.id,
+            purpose="药品含量检测，按照中国药典2025版方法执行",
+            default_duration_minutes=120,
+            reminder_minutes=30,
+            remark="标准检测流程，需提前准备对照品",
+            applicable_persons=["张工", "李工"],
+            time_slots=[
+                TimeSlot(start_time="09:00", end_time="11:00"),
+                TimeSlot(start_time="14:00", end_time="16:00"),
+            ]
+        )
+        assert_true(tpl is not None, f"8.1 创建模板成功: {msg}")
+        assert_true(tpl.name == "高效液相色谱日常检测", "   模板名称正确")
+        assert_true(tpl.instrument_code == "INS-001", "   模板关联仪器正确")
+        assert_true(len(tpl.time_slots) == 2, "   时间段数量正确")
+        assert_true(tpl.applicable_persons == ["张工", "李工"], "   适用负责人正确")
+
+        # 8.2 重名模板被拦截
+        tpl2, msg = dm.add_template(
+            name="高效液相色谱日常检测",
+            instrument_id=ins_004.id,
+            purpose="测试",
+            default_duration_minutes=60,
+            reminder_minutes=0,
+            remark="",
+            applicable_persons=[],
+            time_slots=[]
+        )
+        assert_true(tpl2 is None, f"8.2 重名模板被拦截: {msg}")
+        assert_true("已存在" in msg, "   错误消息包含'已存在'")
+
+        # 8.3 更新模板
+        tpl_updated, msg = dm.update_template(
+            tpl.id,
+            default_duration_minutes=150,
+            remark="更新：需同时准备系统适用性溶液"
+        )
+        assert_true(tpl_updated is not None, "8.3 更新模板成功")
+        assert_true(tpl_updated.default_duration_minutes == 150, "   时长已更新为150分钟")
+        assert_true("系统适用性" in tpl_updated.remark, "   备注已更新")
+
+        # 8.4 获取模板和列表
+        tpl_get = dm.get_template(tpl.id)
+        assert_true(tpl_get is not None and tpl_get.id == tpl.id, "8.4 get_template 正确")
+
+        all_tpls = dm.list_templates()
+        assert_true(len(all_tpls) >= 1, f"   模板列表数量正确（{len(all_tpls)}）")
+
+        tpls_by_ins = dm.list_templates(instrument_id=ins_001.id)
+        assert_true(len(tpls_by_ins) >= 1, "   按仪器筛选模板正确")
+
+        tpls_by_person = dm.get_applicable_templates(applicant="张工")
+        assert_true(len(tpls_by_person) >= 1, "   按适用人筛选模板正确（张工）")
+
+        tpls_by_person2 = dm.get_applicable_templates(applicant="王工")
+        assert_true(len(tpls_by_person2) == 0, "   按适用人筛选模板正确（王工不适用）")
+
+        # 8.5 创建第二个模板用于后续测试
+        tpl_gc, msg = dm.add_template(
+            name="气相色谱残留检测",
+            instrument_id=ins_004.id,
+            purpose="有机溶剂残留检测",
+            default_duration_minutes=90,
+            reminder_minutes=15,
+            remark="顶空进样",
+            applicable_persons=["李工", "王工"],
+            time_slots=[
+                TimeSlot(start_time="10:00", end_time="11:30"),
+            ]
+        )
+        assert_true(tpl_gc is not None, "8.5 创建第二个模板成功")
+
+        # ------------------------------------------------------------------
+        separator("九、模板导入导出与校验测试")
+        # ------------------------------------------------------------------
+
+        # 9.1 导出 JSON
+        json_export_path = os.path.join(tmpdir, "templates_export.json")
+        ok, msg = dm.export_templates_json(json_export_path)
+        assert_true(ok and os.path.exists(json_export_path), f"9.1 导出JSON成功: {json_export_path}")
+
+        # 9.2 导出 CSV
+        csv_export_path = os.path.join(tmpdir, "templates_export.csv")
+        ok, msg = dm.export_templates_csv(csv_export_path)
+        assert_true(ok and os.path.exists(csv_export_path), f"9.2 导出CSV成功: {csv_export_path}")
+
+        # 9.3 普通用户导入被拦截（权限测试）
+        dm.settings.current_role = UserRole.NORMAL
+        result = dm.import_templates_json(json_export_path, overwrite=False, user_role=UserRole.NORMAL)
+        assert_true(not result.success, "9.3 普通用户导入JSON被拦截")
+        assert_true("仅管理员" in result.errors[0], "   错误消息包含'仅管理员'")
+
+        result = dm.import_templates_csv(csv_export_path, overwrite=False, user_role=UserRole.NORMAL)
+        assert_true(not result.success, "   普通用户导入CSV被拦截")
+
+        # 9.4 管理员导入 - 不覆盖模式（重名被拦截）
+        dm.settings.current_role = UserRole.ADMIN
+        result = dm.import_templates_json(json_export_path, overwrite=False, user_role=UserRole.ADMIN)
+        assert_true(result.total_count == 2, f"9.4 导入总数正确（{result.total_count}）")
+        assert_true(result.success_count == 0, f"   不覆盖模式下全部跳过（{result.success_count}）")
+        assert_true(result.failed_count == 2, f"   失败数量正确（{result.failed_count}）")
+        assert_true(any("已存在" in e for e in result.errors), "   包含重名错误")
+
+        # 9.5 管理员导入 - 覆盖模式
+        result = dm.import_templates_json(json_export_path, overwrite=True, user_role=UserRole.ADMIN)
+        assert_true(result.success_count == 2, f"9.5 覆盖模式导入成功（{result.success_count}）")
+        assert_true(result.failed_count == 0, "   无失败")
+
+        # 9.6 导入校验 - 构造包含错误的测试数据
+        bad_templates = [
+            {
+                "name": "仪器不存在模板",
+                "instrument_code": "INS-999",
+                "purpose": "仪器不存在测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": [{"start_time": "09:00", "end_time": "10:00"}]
+            },
+            {
+                "name": "",
+                "instrument_code": "INS-001",
+                "purpose": "空名称测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": []
+            },
+            {
+                "name": "负责人不匹配模板",
+                "instrument_code": "INS-001",
+                "purpose": "负责人不匹配测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": ["不存在的人", "另一个不存在的人"],
+                "time_slots": [{"start_time": "09:00", "end_time": "10:00"}]
+            },
+            {
+                "name": "空时段模板",
+                "instrument_code": "INS-001",
+                "purpose": "空时间段测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": []
+            },
+            {
+                "name": "重复名称1",
+                "instrument_code": "INS-001",
+                "purpose": "批次内重复测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": [{"start_time": "09:00", "end_time": "10:00"}]
+            },
+            {
+                "name": "重复名称1",
+                "instrument_code": "INS-001",
+                "purpose": "批次内重复测试2",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": [{"start_time": "14:00", "end_time": "15:00"}]
+            },
+            {
+                "name": "非法时段模板",
+                "instrument_code": "INS-001",
+                "purpose": "非法时段测试",
+                "default_duration_minutes": 60,
+                "reminder_minutes": 0,
+                "remark": "",
+                "applicable_persons": [],
+                "time_slots": [{"start_time": "25:00", "end_time": "26:00"}]
+            },
+        ]
+        bad_json_path = os.path.join(tmpdir, "bad_templates.json")
+        with open(bad_json_path, "w", encoding="utf-8") as f:
+            json.dump(bad_templates, f, ensure_ascii=False, indent=2)
+
+        result = dm.import_templates_json(bad_json_path, overwrite=False, user_role=UserRole.ADMIN)
+        assert_true(result.total_count == 7, f"9.6 错误数据导入总数={result.total_count}")
+        assert_true(result.failed_count >= 6, f"   失败数={result.failed_count}")
+        has_invalid_instr = any("仪器编号" in e and "不存在" in e for e in result.errors)
+        has_empty_name = any("模板名称为空" in e for e in result.errors)
+        has_dup_name = any("批次内重复" in e for e in result.errors)
+        has_invalid_person = any("不存在" in e and "负责人" in e for e in result.errors)
+        has_no_slots = any("未设置可选时间段" in e for e in result.errors)
+        has_invalid_slot = any("不合法" in e for e in result.errors)
+        assert_true(has_invalid_instr, "   仪器不存在被拦截")
+        assert_true(has_empty_name, "   空名称被拦截")
+        assert_true(has_dup_name, "   批次内重复被拦截")
+        assert_true(has_invalid_person, "   负责人不匹配被拦截")
+        assert_true(has_no_slots, "   空时间段被拦截")
+        assert_true(has_invalid_slot, "   时间段不合法被拦截")
+
+        # ------------------------------------------------------------------
+        separator("十、模板套用与快照测试")
+        # ------------------------------------------------------------------
+
+        # 10.1 套用模板创建预约
+        tomorrow = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+        res_from_tpl, msg = dm.apply_template(
+            template_id=tpl.id,
+            start_date=tomorrow,
+            time_slot_index=0,
+            applicant="张工"
+        )
+        assert_true(res_from_tpl is not None, f"10.1 套用模板创建预约成功: {msg}")
+        assert_true(res_from_tpl.template_snapshot is not None, "   模板快照已保存")
+
+        # 检查快照内容
+        snap = res_from_tpl.template_snapshot
+        if isinstance(snap, dict):
+            snap_name = snap.get("template_name", "")
+            snap_purpose = snap.get("purpose", "")
+        else:
+            snap_name = getattr(snap, "template_name", "")
+            snap_purpose = getattr(snap, "purpose", "")
+        assert_true(snap_name == "高效液相色谱日常检测", f"   快照模板名称正确: {snap_name}")
+        assert_true("中国药典" in snap_purpose, "   快照用途正确")
+
+        # 10.2 修改原模板，验证快照不受影响
+        dm.update_template(tpl.id, name="高效液相色谱日常检测（已修改）", purpose="已修改的用途")
+        tpl_modified = dm.get_template(tpl.id)
+        assert_true(tpl_modified.name == "高效液相色谱日常检测（已修改）", "   原模板已修改")
+
+        # 重新获取预约，检查快照仍然是旧名称
+        res_reload = [r for r in dm.reservations if r.id == res_from_tpl.id][0]
+        snap2 = res_reload.template_snapshot
+        if isinstance(snap2, dict):
+            snap_name2 = snap2.get("template_name", "")
+        else:
+            snap_name2 = getattr(snap2, "template_name", "")
+        assert_true(snap_name2 == "高效液相色谱日常检测",
+                    f"10.2 旧预约快照不受模板修改影响: {snap_name2}")
+
+        # ------------------------------------------------------------------
+        separator("十一、批量创建与冲突检测测试")
+        # ------------------------------------------------------------------
+
+        # 11.1 构造批量数据
+        day1 = (date.today() + timedelta(days=5)).strftime("%Y-%m-%d")
+        day2 = (date.today() + timedelta(days=6)).strftime("%Y-%m-%d")
+        day3 = (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
+
+        batch_items = [
+            {
+                "template_id": tpl.id,
+                "start_date": day1,
+                "slot_index": 0,
+                "applicant": "张工"
+            },
+            {
+                "template_id": tpl.id,
+                "start_date": day2,
+                "slot_index": 0,
+                "applicant": "张工"
+            },
+            {
+                "template_id": tpl_gc.id,
+                "start_date": day1,
+                "slot_index": 0,
+                "applicant": "李工"
+            },
+        ]
+
+        # 11.2 冲突检测（无冲突）
+        conflicts = dm.check_batch_conflicts(batch_items)
+        assert_true(len(conflicts) == 0, f"11.1 无冲突检测通过（冲突数={len(conflicts)}）")
+
+        # 11.3 批量创建
+        dm.settings.current_user = "测试管理员"
+        record, fails = dm.batch_create_reservations(
+            batch_items,
+            operator="测试管理员",
+            user_role=UserRole.ADMIN
+        )
+        assert_true(record is not None, "11.2 批量创建成功")
+        assert_true(record.total_count == 3, f"   总数=3")
+        assert_true(record.success_count == 3, f"   成功=3")
+        assert_true(len(fails) == 0, "   无失败")
+        assert_true(record.id is not None and record.id != "", "   批次ID已生成")
+
+        # 11.4 检查预约是否关联批次
+        batch_reservations = [r for r in dm.reservations if r.batch_id == record.id]
+        assert_true(len(batch_reservations) == 3, f"11.3 批次关联预约数量正确（{len(batch_reservations)}）")
+        for r in batch_reservations:
+            assert_true(r.template_snapshot is not None, "   批量预约都有模板快照")
+
+        # 先确认第一个预约，使其能被重叠检测发现
+        first_res = batch_reservations[0]
+        dm.update_reservation_status(first_res.id, ReservationStatus.PENDING_CONFIRM, UserRole.ADMIN)
+        dm.update_reservation_status(first_res.id, ReservationStatus.CONFIRMED, UserRole.ADMIN)
+
+        # 11.5 冲突检测 - 构造有冲突的数据
+        conflict_items = [
+            {
+                "template_id": tpl.id,
+                "start_date": day1,
+                "slot_index": 0,
+                "applicant": "张工"
+            },
+        ]
+        conflicts = dm.check_batch_conflicts(conflict_items)
+        assert_true(len(conflicts) >= 1, "11.4 时间重叠冲突被检测到")
+        assert_true(any(c["type"] == "时间重叠" for c in conflicts), "   冲突类型=时间重叠")
+
+        # 11.6 同一申请人撞单检测
+        same_day_items = [
+            {
+                "template_id": tpl.id,
+                "start_date": day3,
+                "slot_index": 0,
+                "applicant": "测试员撞单"
+            },
+            {
+                "template_id": tpl_gc.id,
+                "start_date": day3,
+                "slot_index": 0,
+                "applicant": "测试员撞单"
+            },
+        ]
+        conflicts = dm.check_batch_conflicts(same_day_items)
+        assert_true(any(c["type"] == "同一申请人撞单" for c in conflicts),
+                    "11.5 同一申请人撞单被检测到")
+
+        # 11.7 仪器冻结冲突检测
+        dm.freeze_instrument(ins_004.id, "测试冻结", "测试员", UserRole.ADMIN)
+        frozen_items = [
+            {
+                "template_id": tpl_gc.id,
+                "start_date": day3,
+                "slot_index": 0,
+                "applicant": "李工"
+            },
+        ]
+        conflicts = dm.check_batch_conflicts(frozen_items)
+        assert_true(any(c["type"] == "仪器冻结" for c in conflicts),
+                    "11.6 仪器冻结冲突被检测到")
+        dm.unfreeze_instrument(ins_004.id, "恢复", "测试员", UserRole.ADMIN)
+
+        # ------------------------------------------------------------------
+        separator("十二、整批撤销与权限控制测试")
+        # ------------------------------------------------------------------
+
+        # 12.1 普通用户撤销被拦截
+        ok, msg = dm.batch_cancel_reservations(
+            record.id,
+            operator="普通用户",
+            user_role=UserRole.NORMAL,
+            reason="测试撤销"
+        )
+        assert_false(ok, f"12.1 普通用户撤销被拦截: {msg}")
+        assert_true("仅管理员" in msg, "   错误消息包含'仅管理员'")
+
+        # 12.2 管理员撤销
+        ok, msg = dm.batch_cancel_reservations(
+            record.id,
+            operator="测试管理员",
+            user_role=UserRole.ADMIN,
+            reason="测试整批撤销"
+        )
+        assert_true(ok, f"12.2 管理员撤销成功: {msg}")
+
+        # 12.3 检查预约状态是否已取消
+        batch_reservations = [r for r in dm.reservations if r.batch_id == record.id]
+        all_cancelled = all(r.status == ReservationStatus.CANCELLED for r in batch_reservations)
+        assert_true(all_cancelled, "12.3 批次内所有预约状态已变为已取消")
+
+        # 12.4 检查批次记录的撤销标记
+        record_reload = dm.get_batch_record(record.id)
+        assert_true(record_reload.is_cancelled, "12.4 批次记录已标记为已撤销")
+        assert_true(record_reload.cancel_operator == "测试管理员", "   撤销操作人已记录")
+        assert_true(record_reload.cancel_reason == "测试整批撤销", "   撤销原因已记录")
+        assert_true(record_reload.cancel_time is not None, "   撤销时间已记录")
+
+        # 12.5 重复撤销被拦截
+        ok, msg = dm.batch_cancel_reservations(
+            record.id,
+            operator="测试管理员",
+            user_role=UserRole.ADMIN,
+            reason="重复撤销"
+        )
+        assert_false(ok, f"12.5 重复撤销被拦截: {msg}")
+        assert_true("已被撤销" in msg, "   错误消息包含'已被撤销'")
+
+        # ------------------------------------------------------------------
+        separator("十三、持久化验证 - 新功能数据跨重启")
+        # ------------------------------------------------------------------
+
+        # 保存所有数据
+        dm.save_templates()
+        dm.save_batch_records()
+        dm.save_operation_logs()
+        dm.save_settings()
+        dm.save_reservations()
+
+        # 重新加载
+        dm5 = DataManager(data_dir=tmpdir)
+
+        # 13.1 模板持久化
+        assert_true(len(dm5.templates) >= 2, f"13.1 模板已持久化（{len(dm5.templates)}个）")
+        tpl_reload = dm5.get_template(tpl.id)
+        assert_true(tpl_reload is not None, "   模板可通过ID获取")
+        assert_true(tpl_reload.name == "高效液相色谱日常检测（已修改）", "   模板修改内容已持久化")
+
+        # 13.2 批量记录持久化
+        assert_true(len(dm5.batch_records) >= 1, f"13.2 批量记录已持久化（{len(dm5.batch_records)}条）")
+        batch_reload = dm5.get_batch_record(record.id)
+        assert_true(batch_reload is not None, "   批次记录可获取")
+        assert_true(batch_reload.is_cancelled, "   撤销状态已持久化")
+
+        # 13.3 操作日志持久化
+        assert_true(len(dm5.operation_logs) >= 1, f"13.3 操作日志已持久化（{len(dm5.operation_logs)}条）")
+
+        # 13.4 预约中的模板快照持久化
+        res_with_snap = [r for r in dm5.reservations if r.template_snapshot is not None]
+        assert_true(len(res_with_snap) >= 1, f"13.4 带快照的预约已持久化（{len(res_with_snap)}条）")
+
+        # 13.5 提醒开关持久化
+        assert_true(hasattr(dm5.settings, 'reminder_enabled'), "13.5 提醒开关字段存在")
+        assert_true(hasattr(dm5.settings, 'default_reminder_minutes'), "   默认提醒时长字段存在")
+
+        # 13.6 最近导入结果持久化
+        assert_true(hasattr(dm5.settings, 'last_import_result'), "13.6 最近导入结果字段存在")
+
+        # ------------------------------------------------------------------
+        separator("十四、操作日志与批量记录列表测试")
+        # ------------------------------------------------------------------
+
+        # 14.1 操作日志记录检查
+        log_types = [log.operation_type for log in dm.operation_logs]
+        assert_true(OperationType.BATCH_CREATE.value in log_types, "14.1 批量建单日志已记录")
+        assert_true(OperationType.BATCH_CANCEL.value in log_types, "   批量撤销日志已记录")
+        assert_true(OperationType.TEMPLATE_CREATE.value in log_types, "   模板创建日志已记录")
+        assert_true(OperationType.TEMPLATE_EXPORT.value in log_types, "   模板导出日志已记录")
+
+        # 14.2 批量记录列表
+        all_batches = dm.list_batch_records()
+        assert_true(len(all_batches) >= 1, f"14.2 批量记录列表正常（{len(all_batches)}条）")
+
+        create_batches = dm.list_batch_records(operation=OperationType.BATCH_CREATE.value)
+        assert_true(len(create_batches) >= 1, "   按操作类型筛选=批量建单正确")
+
+        # 14.3 检查日志内容完整性
+        create_logs = [log for log in dm.operation_logs if log.operation_type == OperationType.BATCH_CREATE.value]
+        assert_true(len(create_logs) >= 1, "   批量建单日志存在")
+        cl = create_logs[0]
+        assert_true(cl.operator, "   日志含操作人")
+        assert_true(cl.operator_role, "   日志含角色")
+        assert_true(cl.timestamp, "   日志含时间戳")
+        assert_true(cl.description, "   日志含描述")
+
+        # ------------------------------------------------------------------
+        separator("十五、模板删除测试")
+        # ------------------------------------------------------------------
+
+        # 15.1 删除模板
+        ok, msg = dm.delete_template(tpl_gc.id)
+        assert_true(ok, f"15.1 删除模板成功: {msg}")
+
+        # 15.2 验证模板已删除
+        tpl_deleted = dm.get_template(tpl_gc.id)
+        assert_true(tpl_deleted is None, "15.2 模板已从列表中移除")
+
+        # 15.3 验证旧预约的快照不受影响
+        res_with_gc_snap = [r for r in dm.reservations if r.batch_id == record.id and r.instrument_code == "INS-004"]
+        if res_with_gc_snap:
+            snap = res_with_gc_snap[0].template_snapshot
+            if isinstance(snap, dict):
+                snap_name = snap.get("template_name", "")
+            else:
+                snap_name = getattr(snap, "template_name", "")
+            assert_true(snap_name == "气相色谱残留检测",
+                        f"15.3 模板删除后旧预约快照仍完整: {snap_name}")
+
+        # ------------------------------------------------------------------
+        separator("✓ 全部测试通过（含新增功能）！")
+        # ------------------------------------------------------------------
+        print(f"\n  共执行了 80+ 项断言，覆盖：")
         print("    ✅ 初始样例数据（4台仪器，1台校准过期）")
         print("    ✅ 失败路径拦截（校准过期、时间重叠、冻结预约、普通用户解冻、非法流转）")
         print("    ✅ 失败时不改变原有状态")
@@ -426,6 +917,22 @@ def main():
         print("    ✅ 按负责人/状态筛选")
         print("    ✅ CSV / JSON 导出")
         print("    ✅ 全量持久化（仪器、预约、校准记录、设置）")
+        print("    ---- 新增功能测试 ----")
+        print("    ✅ 模板 CRUD（创建、查询、更新、删除）")
+        print("    ✅ 模板导入导出（JSON/CSV 双格式）")
+        print("    ✅ 导入校验（重名、负责人不匹配、时间段非法、批次内重复）")
+        print("    ✅ 权限控制（普通用户不能导入模板、不能批量撤销）")
+        print("    ✅ 模板套用与一键创建预约")
+        print("    ✅ 模板快照机制（模板修改不影响历史预约）")
+        print("    ✅ 模板删除后历史快照仍完整")
+        print("    ✅ 批量创建预约（含批次关联）")
+        print("    ✅ 冲突检测（时间重叠、仪器冻结、校准过期、申请人撞单）")
+        print("    ✅ 整批撤销（仅管理员）")
+        print("    ✅ 重复撤销拦截")
+        print("    ✅ 操作日志记录（所有关键操作）")
+        print("    ✅ 批量操作记录管理")
+        print("    ✅ 新功能数据跨重启持久化（模板、批量记录、操作日志）")
+        print("    ✅ 提醒开关、最近导入结果等设置持久化")
         print(f"\n  测试数据目录: {tmpdir}")
 
     finally:

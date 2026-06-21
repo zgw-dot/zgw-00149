@@ -1,0 +1,12 @@
+{
+  "export_dir": "",
+  "filter_person": "",
+  "filter_status": "",
+  "ins_filter_person": "",
+  "ins_filter_status": "",
+  "current_user": "当前用户",
+  "current_role": "普通用户",
+  "reminder_enabled": true,
+  "default_reminder_minutes": 30,
+  "last_import_result": null
+}

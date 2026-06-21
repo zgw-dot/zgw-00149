@@ -1,0 +1,11 @@
+[
+  {
+    "id": "49cdeeab-1efa-41c0-8324-008d21254880",
+    "operation_type": "模板创建",
+    "operator": "当前用户",
+    "operator_role": "普通用户",
+    "description": "创建模板：GUI冒烟测试模板",
+    "detail": "仪器=INS-001, 时长=90分钟",
+    "timestamp": "2026-06-21 11:18:46"
+  }
+]

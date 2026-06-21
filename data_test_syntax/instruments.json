@@ -1,0 +1,78 @@
+[
+  {
+    "id": "dcce0a67-30a8-4403-8c02-d0fd60856fe8",
+    "code": "INS-001",
+    "model": "高效液相色谱仪 HPLC-2025",
+    "person_in_charge": "张工",
+    "calibration_expiry": "2026-12-18",
+    "available_time_slots": [
+      {
+        "start_time": "09:00",
+        "end_time": "12:00"
+      },
+      {
+        "start_time": "14:00",
+        "end_time": "17:00"
+      }
+    ],
+    "status": "正常",
+    "freeze_reason": null,
+    "freeze_operator": null,
+    "freeze_time": null
+  },
+  {
+    "id": "d6c5214c-54f2-4e8f-957b-5bc70c49710b",
+    "code": "INS-002",
+    "model": "气相色谱仪 GC-8860",
+    "person_in_charge": "李工",
+    "calibration_expiry": "2026-07-21",
+    "available_time_slots": [
+      {
+        "start_time": "08:00",
+        "end_time": "11:30"
+      },
+      {
+        "start_time": "13:30",
+        "end_time": "18:00"
+      }
+    ],
+    "status": "正常",
+    "freeze_reason": null,
+    "freeze_operator": null,
+    "freeze_time": null
+  },
+  {
+    "id": "96e136c2-4442-4a11-9f53-b7fbafc195c5",
+    "code": "INS-003",
+    "model": "紫外可见分光光度计 UV-1800",
+    "person_in_charge": "王工",
+    "calibration_expiry": "2026-06-06",
+    "available_time_slots": [
+      {
+        "start_time": "10:00",
+        "end_time": "16:00"
+      }
+    ],
+    "status": "校准过期",
+    "freeze_reason": null,
+    "freeze_operator": null,
+    "freeze_time": null
+  },
+  {
+    "id": "2d67432c-3c26-4aa1-aebe-442499bd5b8f",
+    "code": "INS-004",
+    "model": "电子分析天平 ME204E",
+    "person_in_charge": "张工",
+    "calibration_expiry": "2026-09-19",
+    "available_time_slots": [
+      {
+        "start_time": "08:30",
+        "end_time": "17:30"
+      }
+    ],
+    "status": "正常",
+    "freeze_reason": null,
+    "freeze_operator": null,
+    "freeze_time": null
+  }
+]
