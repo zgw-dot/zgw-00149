@@ -2,12 +2,14 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import os
 from datetime import datetime, date, timedelta
+from typing import List, Dict, Any, Optional
 
 from data_manager import (
     DataManager, InstrumentStatus, ReservationStatus, UserRole,
     TimeSlot, STATUS_FLOW, OperationType, ReservationTemplate,
     ImportResult, BatchRecord, TemplateSnapshot, BatchItemResult,
-    SandboxItemStatus, SandboxDraft, SandboxDraftItem
+    SandboxItemStatus, SandboxDraft, SandboxDraftItem,
+    STANDARD_COLUMNS, ImportMappingScheme, PrecheckResult, PrecheckIssue
 )
 
 
@@ -2369,6 +2371,10 @@ class App:
         self.batch_menu.add_command(label="批量操作记录", command=self._show_batch_management)
         self.batch_menu.add_separator()
         self.batch_menu.add_command(label="预约沙盘", command=self._show_sandbox)
+        self.batch_menu.add_separator()
+        self.menu_import_mapping = self.batch_menu.add_command(
+            label="预约导入映射中心", command=self._show_import_mapping_center
+        )
         self.menubar.add_cascade(label="批量操作", menu=self.batch_menu)
 
         role_menu = tk.Menu(self.menubar, tearoff=0)
@@ -2745,6 +2751,14 @@ class App:
                 self.template_menu.entryconfig(show_last_idx, state="disabled")
         except tk.TclError:
             pass
+        try:
+            mapping_idx = 6
+            if is_admin:
+                self.batch_menu.entryconfig(mapping_idx, state="normal")
+            else:
+                self.batch_menu.entryconfig(mapping_idx, state="disabled")
+        except tk.TclError:
+            pass
 
     def _show_last_import_result(self):
         if self.dm.settings.current_role != UserRole.ADMIN:
@@ -3115,6 +3129,14 @@ class App:
         self.root.wait_window(dlg)
         self._refresh_reservations()
 
+    def _show_import_mapping_center(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可使用预约导入映射中心", parent=self.root)
+            return
+        dlg = ImportMappingCenterDialog(self.root, self.dm)
+        self.root.wait_window(dlg)
+        self._refresh_reservations()
+
     def _show_operation_logs(self):
         dlg = OperationLogsDialog(self.root, self.dm)
         self.root.wait_window(dlg)
@@ -3176,6 +3198,696 @@ class App:
 def main():
     app = App()
     app.run()
+
+
+class ImportMappingCenterDialog(tk.Toplevel):
+    def __init__(self, parent, dm: DataManager):
+        super().__init__(parent)
+        self.dm = dm
+        self.title("预约导入映射中心")
+        self.geometry("1080x760")
+        self.minsize(1000, 700)
+        self.transient(parent)
+        self.grab_set()
+
+        self.file_path = ""
+        self.file_headers: List[str] = []
+        self.file_rows: List[Dict[str, Any]] = []
+        self.current_scheme: Optional[ImportMappingScheme] = None
+        self.column_mapping_vars: Dict[str, tk.StringVar] = {}
+        self.precheck_result: Optional[PrecheckResult] = None
+
+        self._build_ui()
+        self._refresh_scheme_list()
+        self._restore_session()
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.tab1 = ttk.Frame(nb, padding=10)
+        self.tab2 = ttk.Frame(nb, padding=10)
+        self.tab3 = ttk.Frame(nb, padding=10)
+        nb.add(self.tab1, text="1. 选择文件 & 方案管理")
+        nb.add(self.tab2, text="2. 列映射配置")
+        nb.add(self.tab3, text="3. 预检 & 导入执行")
+        self.nb = nb
+
+        self._build_tab1()
+        self._build_tab2()
+        self._build_tab3()
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Label(bottom, text="※ 仅管理员可维护方案，所有操作均记入操作日志",
+                  foreground="#666").pack(side="left")
+        ttk.Button(bottom, text="关闭", command=self.destroy, width=12).pack(side="right")
+
+    def _build_tab1(self):
+        padding = {"padx": 8, "pady": 5}
+
+        file_frame = ttk.LabelFrame(self.tab1, text="步骤1：选择导入文件（CSV / Excel）", padding=10)
+        file_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(file_frame, text="文件路径：").grid(row=0, column=0, sticky="e", **padding)
+        self.file_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_var, width=70).grid(row=0, column=1, **padding)
+        ttk.Button(file_frame, text="浏览...", command=self._select_file, width=10).grid(row=0, column=2, **padding)
+        ttk.Button(file_frame, text="解析文件", command=self._parse_selected_file, width=10).grid(row=0, column=3, **padding)
+
+        self.file_info_label = ttk.Label(file_frame, text="尚未选择文件", foreground="#888")
+        self.file_info_label.grid(row=1, column=0, columnspan=4, sticky="w", padx=8)
+
+        scheme_frame = ttk.LabelFrame(self.tab1, text="步骤2：选择 / 管理映射方案", padding=10)
+        scheme_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        top_row = ttk.Frame(scheme_frame)
+        top_row.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(top_row, text="已有方案：").pack(side="left", padx=(0, 8))
+        self.scheme_var = tk.StringVar()
+        self.scheme_combo = ttk.Combobox(top_row, textvariable=self.scheme_var, state="readonly", width=40)
+        self.scheme_combo.pack(side="left", padx=(0, 8))
+        self.scheme_combo.bind("<<ComboboxSelected>>", self._on_scheme_select)
+
+        ttk.Button(top_row, text="加载方案", command=self._load_selected_scheme, width=10).pack(side="left", padx=3)
+        ttk.Button(top_row, text="自动匹配列", command=self._auto_match_columns, width=12).pack(side="left", padx=3)
+
+        btn_sep = ttk.Frame(top_row)
+        btn_sep.pack(side="left", padx=10)
+
+        self.btn_save_scheme = ttk.Button(top_row, text="存为新方案", command=self._save_as_new_scheme, width=12)
+        self.btn_save_scheme.pack(side="left", padx=3)
+        self.btn_update_scheme = ttk.Button(top_row, text="更新当前方案", command=self._update_current_scheme, width=14)
+        self.btn_update_scheme.pack(side="left", padx=3)
+        self.btn_revoke_scheme = ttk.Button(top_row, text="撤销当前方案", command=self._revoke_current_scheme, width=14)
+        self.btn_revoke_scheme.pack(side="left", padx=3)
+        self.btn_delete_scheme = ttk.Button(top_row, text="删除方案", command=self._delete_selected_scheme, width=10)
+        self.btn_delete_scheme.pack(side="left", padx=3)
+
+        export_sep = ttk.Frame(scheme_frame)
+        export_sep.pack(fill="x", pady=(0, 8))
+        ttk.Button(export_sep, text="导出方案备份(JSON)", command=self._export_schemes, width=20).pack(side="left", padx=3)
+        ttk.Button(export_sep, text="导入方案(JSON)", command=self._import_schemes, width=16).pack(side="left", padx=3)
+
+        list_frame = ttk.LabelFrame(scheme_frame, text="方案列表（双击加载）", padding=8)
+        list_frame.pack(fill="both", expand=True)
+
+        cols = ("name", "created_by", "created_at", "updated_at", "is_revoked", "revoke_reason")
+        self.scheme_tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=8)
+        for c, t, w in [
+            ("name", "方案名称", 180), ("created_by", "创建人", 90),
+            ("created_at", "创建时间", 140), ("updated_at", "更新时间", 140),
+            ("is_revoked", "状态", 70), ("revoke_reason", "撤销原因", 180),
+        ]:
+            self.scheme_tree.heading(c, text=t)
+            self.scheme_tree.column(c, width=w, anchor="w")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.scheme_tree.yview)
+        self.scheme_tree.configure(yscrollcommand=vsb.set)
+        self.scheme_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.scheme_tree.bind("<Double-1>", lambda e: self._load_selected_scheme())
+
+        tip = ttk.Label(self.tab1,
+                        text="使用流程：选择文件 → 解析表头 → 选择或创建映射方案 → 切到Tab2对列 → 切到Tab3预检 → 全部通过后生成草稿/沙盘",
+                        foreground="#1565c0", font=("Arial", 10, "bold"))
+        tip.pack(fill="x", pady=(0, 8))
+
+    def _build_tab2(self):
+        padding = {"padx": 8, "pady": 5}
+
+        top = ttk.Frame(self.tab2)
+        top.pack(fill="x", pady=(0, 8))
+        ttk.Label(top, text="※ 从下拉列表中为每个「标准字段」选择文件中对应的原始列名（必填项标★）",
+                  foreground="#666").pack(side="left")
+
+        fmt_frame = ttk.LabelFrame(self.tab2, text="日期 / 时间格式（默认ISO格式，如不一致请修改）", padding=10)
+        fmt_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(fmt_frame, text="完整日期时间格式：").grid(row=0, column=0, sticky="e", **padding)
+        self.dt_fmt_var = tk.StringVar(value="%Y-%m-%d %H:%M:%S")
+        ttk.Entry(fmt_frame, textvariable=self.dt_fmt_var, width=25).grid(row=0, column=1, sticky="w", **padding)
+        ttk.Label(fmt_frame, text="例：%Y-%m-%d %H:%M:%S", foreground="gray").grid(row=0, column=2, sticky="w", **padding)
+
+        ttk.Label(fmt_frame, text="仅日期格式：").grid(row=1, column=0, sticky="e", **padding)
+        self.d_fmt_var = tk.StringVar(value="%Y-%m-%d")
+        ttk.Entry(fmt_frame, textvariable=self.d_fmt_var, width=25).grid(row=1, column=1, sticky="w", **padding)
+        ttk.Label(fmt_frame, text="例：%Y-%m-%d", foreground="gray").grid(row=1, column=2, sticky="w", **padding)
+
+        ttk.Label(fmt_frame, text="仅时间格式：").grid(row=2, column=0, sticky="e", **padding)
+        self.t_fmt_var = tk.StringVar(value="%H:%M:%S")
+        ttk.Entry(fmt_frame, textvariable=self.t_fmt_var, width=25).grid(row=2, column=1, sticky="w", **padding)
+        ttk.Label(fmt_frame, text="例：%H:%M:%S", foreground="gray").grid(row=2, column=2, sticky="w", **padding)
+
+        map_frame = ttk.LabelFrame(self.tab2, text="列映射配置", padding=10)
+        map_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        header_cols = ("std_field", "std_desc", "required", "raw_col")
+        self.map_tree = ttk.Treeview(map_frame, columns=header_cols, show="headings", height=10)
+        self.map_tree.heading("std_field", text="标准字段(Key)")
+        self.map_tree.heading("std_desc", text="标准字段(说明)")
+        self.map_tree.heading("required", text="必填")
+        self.map_tree.heading("raw_col", text="当前对应原始列 → 点击编辑")
+        self.map_tree.column("std_field", width=150, anchor="w")
+        self.map_tree.column("std_desc", width=150, anchor="w")
+        self.map_tree.column("required", width=50, anchor="center")
+        self.map_tree.column("raw_col", width=500, anchor="w")
+        self.map_tree.pack(fill="both", expand=True)
+        self.map_tree.bind("<Double-1>", self._on_map_tree_double_click)
+
+        tip2 = ttk.Label(self.tab2,
+                         text="※ 「日期」列可选：如文件中开始/结束时间已经是完整日期时间，可不填日期列\n※ 双击表格最后一行可弹出下拉选择原始列",
+                         foreground="#666")
+        tip2.pack(fill="x")
+
+    def _build_tab3(self):
+        padding = {"padx": 8, "pady": 5}
+
+        action_frame = ttk.LabelFrame(self.tab3, text="预检操作", padding=10)
+        action_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Button(action_frame, text="▶ 运行预检", command=self._run_precheck, width=14).grid(row=0, column=0, **padding)
+        ttk.Button(action_frame, text="导出失败行(CSV)", command=self._export_failed_rows, width=16).grid(row=0, column=1, **padding)
+        ttk.Label(action_frame, text="→ 只有全部通过预检，才能生成草稿或送入沙盘", foreground="#c62828").grid(row=0, column=2, sticky="w", **padding)
+
+        self.precheck_summary = ttk.Label(action_frame, text="尚未运行预检", foreground="#888", font=("Arial", 10, "bold"))
+        self.precheck_summary.grid(row=1, column=0, columnspan=3, sticky="w", padx=8)
+
+        issue_frame = ttk.LabelFrame(self.tab3, text="预检问题明细（逐条列出）", padding=10)
+        issue_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        issue_cols = ("row", "type", "col", "detail")
+        self.issue_tree = ttk.Treeview(issue_frame, columns=issue_cols, show="headings", height=10)
+        self.issue_tree.heading("row", text="行号")
+        self.issue_tree.heading("type", text="问题类型")
+        self.issue_tree.heading("col", text="关联列")
+        self.issue_tree.heading("detail", text="详细说明")
+        self.issue_tree.column("row", width=60, anchor="center")
+        self.issue_tree.column("type", width=90, anchor="w")
+        self.issue_tree.column("col", width=100, anchor="w")
+        self.issue_tree.column("detail", width=700, anchor="w")
+        vsb2 = ttk.Scrollbar(issue_frame, orient="vertical", command=self.issue_tree.yview)
+        self.issue_tree.configure(yscrollcommand=vsb2.set)
+        self.issue_tree.pack(side="left", fill="both", expand=True)
+        vsb2.pack(side="right", fill="y")
+
+        self.issue_tree.tag_configure("缺列", background="#ffebee")
+        self.issue_tree.tag_configure("空值", background="#fff3e0")
+        self.issue_tree.tag_configure("时间格式错", background="#fffde7")
+        self.issue_tree.tag_configure("时间逻辑错", background="#fce4ec")
+        self.issue_tree.tag_configure("仪器不存在", background="#f3e5f5")
+        self.issue_tree.tag_configure("重复行", background="#e8f5e9")
+
+        exec_frame = ttk.LabelFrame(self.tab3, text="导入执行（必须预检0失败）", padding=10)
+        exec_frame.pack(fill="x")
+
+        ttk.Label(exec_frame, text="目标位置：").grid(row=0, column=0, sticky="e", **padding)
+        self.target_var = tk.StringVar(value="草稿")
+        ttk.Radiobutton(exec_frame, text="直接生成草稿预约（DRAFT状态）", variable=self.target_var, value="草稿").grid(row=0, column=1, sticky="w", **padding)
+        ttk.Radiobutton(exec_frame, text="先送入沙盘（需后续确认提交）", variable=self.target_var, value="沙盘").grid(row=0, column=2, sticky="w", **padding)
+
+        ttk.Label(exec_frame, text="草稿/沙盘名称：").grid(row=1, column=0, sticky="e", **padding)
+        self.name_var = tk.StringVar(value=f"导入_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        ttk.Entry(exec_frame, textvariable=self.name_var, width=40).grid(row=1, column=1, columnspan=2, sticky="w", **padding)
+
+        self.btn_execute = ttk.Button(exec_frame, text="▶ 执行导入", command=self._execute_import, width=14, state="disabled")
+        self.btn_execute.grid(row=0, column=3, rowspan=2, padx=20)
+
+    # ==================== Tab1 Actions ====================
+    def _select_file(self):
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
+        filepath = filedialog.askopenfilename(
+            title="选择预约明细文件",
+            initialdir=initial_dir,
+            filetypes=[("支持的文件", "*.csv *.xlsx *.xls"), ("CSV 文件", "*.csv"), ("Excel 文件", "*.xlsx *.xls"), ("所有文件", "*.*")],
+            parent=self,
+        )
+        if filepath:
+            self.file_var.set(filepath)
+            self.file_path = filepath
+            self.dm.settings.import_dir = os.path.dirname(filepath)
+            self.dm.save_settings()
+
+    def _parse_selected_file(self):
+        filepath = self.file_var.get().strip()
+        if not filepath or not os.path.exists(filepath):
+            messagebox.showerror("错误", "请先选择有效的文件", parent=self)
+            return
+        self.file_path = filepath
+        headers, rows, err = self.dm.parse_import_file(filepath)
+        if err:
+            messagebox.showerror("解析失败", err, parent=self)
+            return
+        self.file_headers = headers or []
+        self.file_rows = rows or []
+        info = f"✅ 文件解析成功：{len(self.file_rows)} 条数据，{len(self.file_headers)} 列\n列名：{', '.join(self.file_headers[:10])}"
+        if len(self.file_headers) > 10:
+            info += f"...（共{len(self.file_headers)}列）"
+        self.file_info_label.config(text=info, foreground="#2e7d32")
+
+        self._refresh_map_tree()
+        matched = self.dm.auto_match_columns(self.file_headers)
+        if matched:
+            if messagebox.askyesno("自动匹配", f"检测到文件列名，已自动匹配{len(matched)}个标准字段，是否应用？", parent=self):
+                for std_key, raw_col in matched.items():
+                    if std_key in self.column_mapping_vars:
+                        self.column_mapping_vars[std_key].set(raw_col)
+                self._refresh_map_tree_from_vars()
+
+    def _refresh_scheme_list(self):
+        schemes = self.dm.list_mapping_schemes(include_revoked=True)
+        self._all_schemes = schemes
+        active = [s for s in schemes if not s.is_revoked]
+        display = [f"{s.name}（{s.updated_at[:16]}）" for s in active]
+        self.scheme_combo["values"] = display
+        self._active_schemes = active
+
+        for item in self.scheme_tree.get_children():
+            self.scheme_tree.delete(item)
+        for s in schemes:
+            status = "已撤销" if s.is_revoked else "有效"
+            self.scheme_tree.insert(
+                "", "end", iid=s.id,
+                values=(s.name, s.created_by, s.created_at[:19], s.updated_at[:19],
+                        status, s.revoke_reason or ""),
+                tags=("revoked",) if s.is_revoked else (),
+            )
+        self.scheme_tree.tag_configure("revoked", foreground="#9e9e9e")
+
+    def _on_scheme_select(self, _=None):
+        pass
+
+    def _load_selected_scheme(self):
+        idx = self.scheme_combo.current()
+        if idx < 0:
+            sel = self.scheme_tree.selection()
+            if not sel:
+                messagebox.showinfo("提示", "请先从下拉框或列表中选择方案", parent=self)
+                return
+            scheme = self.dm.get_mapping_scheme(sel[0])
+        else:
+            scheme = self._active_schemes[idx] if idx < len(self._active_schemes) else None
+        if not scheme:
+            messagebox.showerror("错误", "方案不存在", parent=self)
+            return
+        if scheme.is_revoked:
+            messagebox.showwarning("提示", "该方案已被撤销，不能使用", parent=self)
+            return
+        self.current_scheme = scheme
+        self.scheme_combo.current(idx if idx >= 0 else 0)
+        self.dt_fmt_var.set(scheme.datetime_format)
+        self.d_fmt_var.set(scheme.date_format)
+        self.t_fmt_var.set(scheme.time_format)
+        for std_key, var in self.column_mapping_vars.items():
+            raw_col = scheme.column_mapping.get(std_key, "")
+            var.set(raw_col)
+        self._refresh_map_tree_from_vars()
+        self.dm.set_last_mapping_scheme(scheme.id)
+
+    def _auto_match_columns(self):
+        if not self.file_headers:
+            messagebox.showwarning("提示", "请先解析文件获得列名", parent=self)
+            return
+        matched = self.dm.auto_match_columns(self.file_headers)
+        if not matched:
+            messagebox.showinfo("提示", "未能自动识别任何列，请手动匹配", parent=self)
+            return
+        for std_key, raw_col in matched.items():
+            if std_key in self.column_mapping_vars:
+                self.column_mapping_vars[std_key].set(raw_col)
+        self._refresh_map_tree_from_vars()
+        messagebox.showinfo("自动匹配", f"成功匹配 {len(matched)} 个字段", parent=self)
+
+    def _collect_mapping_from_ui(self) -> Dict[str, str]:
+        mapping = {}
+        for std_key, var in self.column_mapping_vars.items():
+            val = var.get().strip()
+            if val:
+                mapping[std_key] = val
+        return mapping
+
+    def _save_as_new_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可创建方案", parent=self)
+            return
+        name = simpledialog.askstring("新建映射方案", "请输入方案名称：", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        mapping = self._collect_mapping_from_ui()
+        scheme, msg = self.dm.create_mapping_scheme(
+            name=name,
+            column_mapping=mapping,
+            operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+            datetime_format=self.dt_fmt_var.get().strip() or "%Y-%m-%d %H:%M:%S",
+            date_format=self.d_fmt_var.get().strip() or "%Y-%m-%d",
+            time_format=self.t_fmt_var.get().strip() or "%H:%M:%S",
+        )
+        if not scheme:
+            messagebox.showerror("创建失败", msg, parent=self)
+            return
+        self.current_scheme = scheme
+        self._refresh_scheme_list()
+        messagebox.showinfo("成功", f"方案「{name}」已创建", parent=self)
+
+    def _update_current_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可更新方案", parent=self)
+            return
+        if not self.current_scheme:
+            messagebox.showwarning("提示", "请先加载一个方案", parent=self)
+            return
+        mapping = self._collect_mapping_from_ui()
+        scheme, msg = self.dm.update_mapping_scheme(
+            scheme_id=self.current_scheme.id,
+            operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+            column_mapping=mapping,
+            datetime_format=self.dt_fmt_var.get().strip() or "%Y-%m-%d %H:%M:%S",
+            date_format=self.d_fmt_var.get().strip() or "%Y-%m-%d",
+            time_format=self.t_fmt_var.get().strip() or "%H:%M:%S",
+        )
+        if not scheme:
+            messagebox.showerror("更新失败", msg, parent=self)
+            return
+        self.current_scheme = scheme
+        self._refresh_scheme_list()
+        messagebox.showinfo("成功", f"方案「{scheme.name}」已更新", parent=self)
+
+    def _revoke_current_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可撤销方案", parent=self)
+            return
+        if not self.current_scheme:
+            sel = self.scheme_tree.selection()
+            if not sel:
+                messagebox.showwarning("提示", "请先选择或加载一个方案", parent=self)
+                return
+            target_id = sel[0]
+        else:
+            target_id = self.current_scheme.id
+        reason = simpledialog.askstring("撤销方案", "请输入撤销原因：", parent=self)
+        if not reason or not reason.strip():
+            return
+        scheme, msg = self.dm.revoke_mapping_scheme(
+            scheme_id=target_id,
+            operator=self.dm.settings.current_user,
+            user_role=self.dm.settings.current_role,
+            reason=reason.strip(),
+        )
+        if not scheme:
+            messagebox.showerror("撤销失败", msg, parent=self)
+            return
+        self.current_scheme = None
+        self._refresh_scheme_list()
+        messagebox.showinfo("成功", f"方案已撤销：{reason.strip()}", parent=self)
+
+    def _delete_selected_scheme(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可删除方案", parent=self)
+            return
+        sel = self.scheme_tree.selection()
+        if not sel:
+            messagebox.showwarning("提示", "请在列表中选择要删除的方案", parent=self)
+            return
+        sid = sel[0]
+        sch = self.dm.get_mapping_scheme(sid)
+        if not sch:
+            return
+        if not messagebox.askyesno("确认删除", f"确定要删除方案「{sch.name}」吗？（不可恢复）", parent=self):
+            return
+        ok, msg = self.dm.delete_mapping_scheme(sid, self.dm.settings.current_user, self.dm.settings.current_role)
+        if not ok:
+            messagebox.showerror("删除失败", msg, parent=self)
+            return
+        self.current_scheme = None
+        self._refresh_scheme_list()
+        messagebox.showinfo("成功", "方案已删除", parent=self)
+
+    def _export_schemes(self):
+        initial_dir = self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出映射方案备份",
+            initialdir=initial_dir,
+            initialfile=f"映射方案备份_{date.today().strftime('%Y%m%d')}.json",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_mapping_schemes(filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"方案已导出到：\n{filepath}", parent=self)
+
+    def _import_schemes(self):
+        if self.dm.settings.current_role != UserRole.ADMIN:
+            messagebox.showerror("权限不足", "仅管理员可导入方案", parent=self)
+            return
+        initial_dir = self.dm.settings.import_dir or os.path.expanduser("~")
+        filepath = filedialog.askopenfilename(
+            title="导入映射方案",
+            initialdir=initial_dir,
+            filetypes=[("JSON 文件", "*.json")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        overwrite = messagebox.askyesno(
+            "覆盖确认",
+            "遇到同名方案是否覆盖？\n选'是'覆盖，选'否'跳过重名",
+            parent=self,
+        )
+        imported, errors = self.dm.import_mapping_schemes(
+            filepath, self.dm.settings.current_user, self.dm.settings.current_role, overwrite=overwrite
+        )
+        msg = f"导入完成：成功 {imported} 个"
+        if errors:
+            msg += f"\n\n提示：\n" + "\n".join(errors[:5])
+        messagebox.showinfo("导入结果", msg, parent=self)
+        self._refresh_scheme_list()
+
+    # ==================== Tab2 Actions ====================
+    def _refresh_map_tree(self):
+        for item in self.map_tree.get_children():
+            self.map_tree.delete(item)
+        self.column_mapping_vars.clear()
+        required_keys = {"instrument_code", "applicant", "start_time", "end_time", "purpose"}
+        for std_key, std_desc in STANDARD_COLUMNS:
+            req = "★" if std_key in required_keys else "○"
+            var = tk.StringVar()
+            self.column_mapping_vars[std_key] = var
+            self.map_tree.insert(
+                "", "end", iid=std_key,
+                values=(std_key, std_desc, req, "（双击右侧选择对应原始列）"),
+            )
+
+    def _refresh_map_tree_from_vars(self):
+        for std_key, std_desc in STANDARD_COLUMNS:
+            var = self.column_mapping_vars.get(std_key)
+            if var:
+                raw = var.get() or "（双击右侧选择对应原始列）"
+                self.map_tree.item(std_key, values=(
+                    std_key, std_desc,
+                    "★" if std_key in {"instrument_code", "applicant", "start_time", "end_time", "purpose"} else "○",
+                    raw,
+                ))
+
+    def _on_map_tree_double_click(self, event):
+        region = self.map_tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
+        col_id = self.map_tree.identify_column(event.x)
+        item_id = self.map_tree.identify_row(event.y)
+        if not item_id:
+            return
+        if col_id != "#4":
+            return
+        if not self.file_headers:
+            messagebox.showinfo("提示", "请先在Tab1解析文件，获得列名后再映射", parent=self)
+            return
+        var = self.column_mapping_vars.get(item_id)
+        if not var:
+            return
+
+        top = tk.Toplevel(self)
+        top.title(f"选择列 - {item_id}")
+        top.geometry("380x420")
+        top.transient(self)
+        top.grab_set()
+
+        ttk.Label(top, text=f"为「{item_id}」选择对应原始列：", padding=10).pack(fill="x")
+
+        listbox = tk.Listbox(top, height=15)
+        listbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        options = ["（不使用/不映射）"] + list(self.file_headers)
+        for o in options:
+            listbox.insert("end", o)
+        current = var.get()
+        if current and current in self.file_headers:
+            listbox.selection_set(self.file_headers.index(current) + 1)
+        else:
+            listbox.selection_set(0)
+
+        def _ok():
+            sel = listbox.curselection()
+            if sel:
+                idx = sel[0]
+                if idx == 0:
+                    var.set("")
+                else:
+                    var.set(options[idx])
+                self._refresh_map_tree_from_vars()
+            top.destroy()
+
+        ttk.Button(top, text="确定", command=_ok, width=10).pack(pady=(0, 10))
+
+    # ==================== Tab3 Actions ====================
+    def _run_precheck(self):
+        if not self.file_path or not os.path.exists(self.file_path):
+            messagebox.showerror("错误", "请先选择并解析文件", parent=self)
+            return
+        mapping = self._collect_mapping_from_ui()
+        required = {"instrument_code", "applicant", "start_time", "end_time", "purpose"}
+        missing = [k for k in required if k not in mapping]
+        if missing:
+            miss_str = ", ".join([dict(STANDARD_COLUMNS)[k] for k in missing])
+            messagebox.showerror("映射不完整", f"必填列尚未映射：{miss_str}", parent=self)
+            return
+        scheme = ImportMappingScheme(
+            id="_temp_precheck_",
+            name="_临时方案_",
+            created_by=self.dm.settings.current_user,
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            updated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            column_mapping=mapping,
+            datetime_format=self.dt_fmt_var.get().strip() or "%Y-%m-%d %H:%M:%S",
+            date_format=self.d_fmt_var.get().strip() or "%Y-%m-%d",
+            time_format=self.t_fmt_var.get().strip() or "%H:%M:%S",
+        )
+        result, err = self.dm.run_import_precheck(self.file_path, scheme)
+        if err:
+            messagebox.showerror("预检失败", err, parent=self)
+            return
+        self.precheck_result = result
+        self._display_precheck_result(result)
+
+    def _display_precheck_result(self, result: PrecheckResult):
+        for item in self.issue_tree.get_children():
+            self.issue_tree.delete(item)
+
+        for issue in result.issues:
+            tag = issue.issue_type
+            self.issue_tree.insert(
+                "", "end",
+                values=(issue.row_number, issue.issue_type, issue.column_name, issue.detail),
+                tags=(tag,),
+            )
+
+        summary = (f"总计 {result.total_rows} 行 | ✅ 通过 {result.pass_rows} 行 | "
+                   f"❌ 失败 {result.fail_rows} 行 | ⚠ 问题 {len(result.issues)} 条 | 来源文件：{result.source_file}")
+        if result.fail_rows == 0:
+            self.precheck_summary.config(text=summary + " 【可以导入】", foreground="#2e7d32")
+            self.btn_execute.config(state="normal")
+        else:
+            self.precheck_summary.config(text=summary + " 【存在失败，不可导入】", foreground="#c62828")
+            self.btn_execute.config(state="disabled")
+
+    def _export_failed_rows(self):
+        if not self.precheck_result:
+            messagebox.showwarning("提示", "请先运行预检", parent=self)
+            return
+        if not self.precheck_result.issues:
+            messagebox.showinfo("提示", "没有失败的行可导出", parent=self)
+            return
+        initial_dir = self.dm.settings.export_dir or os.path.expanduser("~")
+        filepath = filedialog.asksaveasfilename(
+            title="导出预检失败行",
+            initialdir=initial_dir,
+            initialfile=f"预检失败行_{date.today().strftime('%Y%m%d')}.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self,
+        )
+        if not filepath:
+            return
+        ok, msg = self.dm.export_precheck_failed_rows(self.precheck_result, filepath)
+        if not ok:
+            messagebox.showerror("导出失败", msg, parent=self)
+            return
+        self.dm.settings.export_dir = os.path.dirname(filepath)
+        self.dm.save_settings()
+        messagebox.showinfo("成功", f"失败行已导出到：\n{filepath}", parent=self)
+
+    def _execute_import(self):
+        if not self.precheck_result:
+            messagebox.showerror("错误", "请先运行预检", parent=self)
+            return
+        if self.precheck_result.fail_rows > 0:
+            messagebox.showerror("错误", "存在未通过的行，无法执行导入", parent=self)
+            return
+
+        target = self.target_var.get()
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror("错误", "请输入草稿/沙盘名称", parent=self)
+            return
+
+        if target == "草稿":
+            count, ids, errors = self.dm.execute_import_to_drafts(
+                self.precheck_result, self.dm.settings.current_user, self.dm.settings.current_role
+            )
+            msg = f"导入完成！\n\n成功创建草稿：{count} 条"
+            if errors:
+                msg += f"\n失败：{len(errors)} 条\n\n详情：\n" + "\n".join(errors[:10])
+            if count > 0:
+                messagebox.showinfo("导入成功", msg, parent=self)
+            else:
+                messagebox.showwarning("导入无结果", msg, parent=self)
+        else:
+            draft, errors = self.dm.execute_import_to_sandbox(
+                self.precheck_result, name, self.dm.settings.current_user, self.dm.settings.current_role
+            )
+            if not draft:
+                messagebox.showerror("导入失败", "\n".join(errors) if errors else "未知错误", parent=self)
+                return
+            messagebox.showinfo(
+                "已送入沙盘",
+                f"成功创建沙盘草稿「{name}」：{len(draft.items)} 条记录\n\n请在【预约沙盘】中进一步确认和提交",
+                parent=self,
+            )
+        self.destroy()
+
+    # ==================== Session Restore ====================
+    def _restore_session(self):
+        last_file = self.dm.get_last_mapping_file()
+        if last_file and os.path.exists(last_file):
+            self.file_var.set(last_file)
+            self.file_path = last_file
+            self.file_info_label.config(text=f"上次会话恢复：{os.path.basename(last_file)}（请点击'解析文件'）", foreground="#1565c0")
+
+        last_scheme = self.dm.get_last_mapping_scheme()
+        if last_scheme:
+            self.dt_fmt_var.set(last_scheme.datetime_format)
+            self.d_fmt_var.set(last_scheme.date_format)
+            self.t_fmt_var.set(last_scheme.time_format)
+            for i, s in enumerate(self._active_schemes if hasattr(self, "_active_schemes") else []):
+                if s.id == last_scheme.id:
+                    self.scheme_combo.current(i)
+                    self.current_scheme = last_scheme
+                    break
+
+        last_precheck = self.dm.get_last_precheck_result()
+        if last_precheck:
+            self.precheck_result = last_precheck
+            self._display_precheck_result(last_precheck)
+            self.nb.select(self.tab2)
+            self.nb.select(self.tab3)
 
 
 if __name__ == "__main__":

@@ -5,10 +5,15 @@
   "filter_status": "草稿",
   "ins_filter_person": "张工",
   "ins_filter_status": "正常",
-  "current_user": "当前用户",
-  "current_role": "普通用户",
+  "current_user": "review_admin",
+  "current_role": "管理员",
   "reminder_enabled": true,
   "default_reminder_minutes": 30,
   "last_import_result": null,
-  "last_template_snapshots": []
+  "last_template_snapshots": [],
+  "mapping_import_session": {
+    "last_file_path": "",
+    "last_scheme_id": "",
+    "last_precheck_result": null
+  }
 }

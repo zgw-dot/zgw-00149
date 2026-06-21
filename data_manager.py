@@ -48,6 +48,13 @@ class OperationType(str, Enum):
     SANDBOX_SUBMIT = "沙盘提交"
     SANDBOX_WITHDRAW = "沙盘撤回"
     SANDBOX_EXPORT = "沙盘导出"
+    MAPPING_SCHEME_CREATE = "映射方案创建"
+    MAPPING_SCHEME_UPDATE = "映射方案更新"
+    MAPPING_SCHEME_DELETE = "映射方案删除"
+    MAPPING_SCHEME_REVOKE = "映射方案撤销"
+    MAPPING_SCHEME_EXPORT = "映射方案导出"
+    RESERVATION_IMPORT_PRECHECK = "预约导入预检"
+    RESERVATION_IMPORT_EXECUTE = "预约导入执行"
 
 
 STATUS_FLOW = {
@@ -397,6 +404,138 @@ class SandboxDraft:
         )
 
 
+STANDARD_COLUMNS = [
+    ("instrument_code", "仪器编号"),
+    ("applicant", "申请人"),
+    ("reservation_date", "日期"),
+    ("start_time", "开始时间"),
+    ("end_time", "结束时间"),
+    ("purpose", "用途"),
+]
+
+
+@dataclass
+class ImportMappingScheme:
+    id: str
+    name: str
+    created_by: str
+    created_at: str
+    updated_at: str
+    column_mapping: Dict[str, str]
+    datetime_format: str = "%Y-%m-%d %H:%M:%S"
+    date_format: str = "%Y-%m-%d"
+    time_format: str = "%H:%M:%S"
+    is_revoked: bool = False
+    revoked_by: Optional[str] = None
+    revoked_at: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            id=d["id"],
+            name=d["name"],
+            created_by=d["created_by"],
+            created_at=d["created_at"],
+            updated_at=d["updated_at"],
+            column_mapping=d.get("column_mapping", {}),
+            datetime_format=d.get("datetime_format", "%Y-%m-%d %H:%M:%S"),
+            date_format=d.get("date_format", "%Y-%m-%d"),
+            time_format=d.get("time_format", "%H:%M:%S"),
+            is_revoked=d.get("is_revoked", False),
+            revoked_by=d.get("revoked_by"),
+            revoked_at=d.get("revoked_at"),
+            revoke_reason=d.get("revoke_reason"),
+        )
+
+
+@dataclass
+class PrecheckIssue:
+    row_number: int
+    issue_type: str
+    column_name: str
+    detail: str
+    raw_row: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            row_number=d["row_number"],
+            issue_type=d["issue_type"],
+            column_name=d["column_name"],
+            detail=d["detail"],
+            raw_row=d.get("raw_row", {}),
+        )
+
+
+@dataclass
+class PrecheckResult:
+    source_file: str
+    scheme_id: str
+    scheme_name: str
+    total_rows: int = 0
+    pass_rows: int = 0
+    fail_rows: int = 0
+    issues: List[PrecheckIssue] = field(default_factory=list)
+    standard_rows: List[Dict[str, Any]] = field(default_factory=list)
+    timestamp: str = ""
+
+    def to_dict(self):
+        d = asdict(self)
+        d["issues"] = [i.to_dict() for i in self.issues]
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        issues = [PrecheckIssue.from_dict(i) for i in d.get("issues", [])]
+        return cls(
+            source_file=d["source_file"],
+            scheme_id=d["scheme_id"],
+            scheme_name=d["scheme_name"],
+            total_rows=d.get("total_rows", 0),
+            pass_rows=d.get("pass_rows", 0),
+            fail_rows=d.get("fail_rows", 0),
+            issues=issues,
+            standard_rows=d.get("standard_rows", []),
+            timestamp=d.get("timestamp", ""),
+        )
+
+
+@dataclass
+class MappingImportSessionState:
+    last_file_path: str = ""
+    last_scheme_id: str = ""
+    last_precheck_result: Optional[PrecheckResult] = None
+
+    def to_dict(self):
+        d = {
+            "last_file_path": self.last_file_path,
+            "last_scheme_id": self.last_scheme_id,
+        }
+        if self.last_precheck_result:
+            d["last_precheck_result"] = self.last_precheck_result.to_dict()
+        else:
+            d["last_precheck_result"] = None
+        return d
+
+    @classmethod
+    def from_dict(cls, d):
+        precheck = None
+        if d.get("last_precheck_result"):
+            precheck = PrecheckResult.from_dict(d["last_precheck_result"])
+        return cls(
+            last_file_path=d.get("last_file_path", ""),
+            last_scheme_id=d.get("last_scheme_id", ""),
+            last_precheck_result=precheck,
+        )
+
+
 @dataclass
 class BatchRecord:
     id: str
@@ -484,12 +623,14 @@ class AppSettings:
     default_reminder_minutes: int = 30
     last_import_result: Optional[ImportResult] = None
     last_template_snapshots: List[Dict[str, Any]] = field(default_factory=list)
+    mapping_import_session: MappingImportSessionState = field(default_factory=MappingImportSessionState)
 
     def to_dict(self):
         d = asdict(self)
         d["current_role"] = self.current_role.value
         if self.last_import_result:
             d["last_import_result"] = self.last_import_result.to_dict()
+        d["mapping_import_session"] = self.mapping_import_session.to_dict()
         return d
 
     @classmethod
@@ -497,6 +638,9 @@ class AppSettings:
         last_imp = None
         if d.get("last_import_result"):
             last_imp = ImportResult.from_dict(d["last_import_result"])
+        session = MappingImportSessionState()
+        if d.get("mapping_import_session"):
+            session = MappingImportSessionState.from_dict(d["mapping_import_session"])
         return cls(
             export_dir=d.get("export_dir", ""),
             import_dir=d.get("import_dir", ""),
@@ -510,6 +654,7 @@ class AppSettings:
             default_reminder_minutes=d.get("default_reminder_minutes", 30),
             last_import_result=last_imp,
             last_template_snapshots=d.get("last_template_snapshots", []),
+            mapping_import_session=session,
         )
 
 
@@ -527,6 +672,7 @@ class DataManager:
         self.batch_records_file = os.path.join(self.data_dir, "batch_records.json")
         self.operation_logs_file = os.path.join(self.data_dir, "operation_logs.json")
         self.sandbox_drafts_file = os.path.join(self.data_dir, "sandbox_drafts.json")
+        self.mapping_schemes_file = os.path.join(self.data_dir, "mapping_schemes.json")
 
         self.instruments: List[Instrument] = []
         self.reservations: List[Reservation] = []
@@ -536,6 +682,7 @@ class DataManager:
         self.batch_records: List[BatchRecord] = []
         self.operation_logs: List[OperationLogEntry] = []
         self.sandbox_drafts: List[SandboxDraft] = []
+        self.mapping_schemes: List[ImportMappingScheme] = []
 
         self.load_all()
 
@@ -548,6 +695,7 @@ class DataManager:
         self.load_batch_records()
         self.load_operation_logs()
         self.load_sandbox_drafts()
+        self.load_mapping_schemes()
         self._check_calibration_expiry()
 
     # ===== Instrument & Reservation (existing) =====
@@ -2619,3 +2767,704 @@ class DataManager:
         )
 
         self.save_settings()
+
+    # ===== Import Mapping Schemes Module =====
+
+    def load_mapping_schemes(self):
+        if os.path.exists(self.mapping_schemes_file):
+            with open(self.mapping_schemes_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.mapping_schemes = [ImportMappingScheme.from_dict(d) for d in data]
+        else:
+            self.mapping_schemes = []
+
+    def save_mapping_schemes(self):
+        with open(self.mapping_schemes_file, "w", encoding="utf-8") as f:
+            json.dump([s.to_dict() for s in self.mapping_schemes], f, ensure_ascii=False, indent=2)
+
+    def create_mapping_scheme(self, name: str, column_mapping: Dict[str, str],
+                               operator: str, user_role: UserRole,
+                               datetime_format: str = "%Y-%m-%d %H:%M:%S",
+                               date_format: str = "%Y-%m-%d",
+                               time_format: str = "%H:%M:%S"
+                               ) -> Tuple[Optional[ImportMappingScheme], str]:
+        if user_role != UserRole.ADMIN:
+            return None, "仅管理员可创建映射方案"
+
+        name = name.strip() if name else ""
+        if not name:
+            return None, "方案名称不能为空"
+
+        for s in self.mapping_schemes:
+            if s.name == name and not s.is_revoked:
+                return None, f"方案名称「{name}」已存在"
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        scheme = ImportMappingScheme(
+            id=str(uuid.uuid4()),
+            name=name,
+            created_by=operator,
+            created_at=now,
+            updated_at=now,
+            column_mapping=dict(column_mapping),
+            datetime_format=datetime_format,
+            date_format=date_format,
+            time_format=time_format,
+        )
+        self.mapping_schemes.append(scheme)
+        self.save_mapping_schemes()
+
+        self._add_operation_log(
+            operation_type=OperationType.MAPPING_SCHEME_CREATE.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"创建映射方案：{name}",
+            detail=f"方案ID={scheme.id}, 列映射={json.dumps(column_mapping, ensure_ascii=False)}",
+        )
+
+        return scheme, ""
+
+    def update_mapping_scheme(self, scheme_id: str, operator: str, user_role: UserRole,
+                               **kwargs) -> Tuple[Optional[ImportMappingScheme], str]:
+        if user_role != UserRole.ADMIN:
+            return None, "仅管理员可修改映射方案"
+
+        scheme = self.get_mapping_scheme(scheme_id)
+        if not scheme:
+            return None, "映射方案不存在"
+        if scheme.is_revoked:
+            return None, "已撤销的方案不能修改"
+
+        if "name" in kwargs:
+            new_name = kwargs["name"].strip() if kwargs["name"] else ""
+            if not new_name:
+                return None, "方案名称不能为空"
+            for s in self.mapping_schemes:
+                if s.id != scheme_id and s.name == new_name and not s.is_revoked:
+                    return None, f"方案名称「{new_name}」已存在"
+            kwargs["name"] = new_name
+
+        for key, value in kwargs.items():
+            if hasattr(scheme, key):
+                setattr(scheme, key, value)
+
+        scheme.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.save_mapping_schemes()
+
+        self._add_operation_log(
+            operation_type=OperationType.MAPPING_SCHEME_UPDATE.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"更新映射方案：{scheme.name}",
+            detail=f"方案ID={scheme_id}, 更新字段={list(kwargs.keys())}",
+        )
+
+        return scheme, ""
+
+    def delete_mapping_scheme(self, scheme_id: str, operator: str,
+                               user_role: UserRole) -> Tuple[bool, str]:
+        if user_role != UserRole.ADMIN:
+            return False, "仅管理员可删除映射方案"
+
+        scheme = None
+        idx = -1
+        for i, s in enumerate(self.mapping_schemes):
+            if s.id == scheme_id:
+                scheme = s
+                idx = i
+                break
+        if not scheme:
+            return False, "映射方案不存在"
+
+        name = scheme.name
+        del self.mapping_schemes[idx]
+        self.save_mapping_schemes()
+
+        self._add_operation_log(
+            operation_type=OperationType.MAPPING_SCHEME_DELETE.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"删除映射方案：{name}",
+            detail=f"方案ID={scheme_id}",
+        )
+
+        return True, ""
+
+    def revoke_mapping_scheme(self, scheme_id: str, operator: str,
+                               user_role: UserRole, reason: str
+                               ) -> Tuple[Optional[ImportMappingScheme], str]:
+        if user_role != UserRole.ADMIN:
+            return None, "仅管理员可撤销映射方案"
+
+        scheme = self.get_mapping_scheme(scheme_id)
+        if not scheme:
+            return None, "映射方案不存在"
+        if scheme.is_revoked:
+            return None, "该方案已被撤销"
+
+        scheme.is_revoked = True
+        scheme.revoked_by = operator
+        scheme.revoked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        scheme.revoke_reason = reason
+        scheme.updated_at = scheme.revoked_at
+        self.save_mapping_schemes()
+
+        self._add_operation_log(
+            operation_type=OperationType.MAPPING_SCHEME_REVOKE.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"撤销映射方案：{scheme.name}",
+            detail=f"方案ID={scheme_id}, 原因={reason}",
+        )
+
+        return scheme, ""
+
+    def export_mapping_schemes(self, filepath: str, scheme_ids: List[str] = None) -> Tuple[bool, str]:
+        try:
+            if scheme_ids:
+                schemes = [s for s in self.mapping_schemes if s.id in scheme_ids]
+            else:
+                schemes = list(self.mapping_schemes)
+
+            export_data = {
+                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "exported_by": self.settings.current_user,
+                "scheme_count": len(schemes),
+                "schemes": [s.to_dict() for s in schemes],
+            }
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+
+            self._add_operation_log(
+                operation_type=OperationType.MAPPING_SCHEME_EXPORT.value,
+                operator=self.settings.current_user,
+                operator_role=self.settings.current_role.value,
+                description=f"导出映射方案：{len(schemes)}个",
+                detail=f"文件={filepath}",
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    def import_mapping_schemes(self, filepath: str, operator: str,
+                                user_role: UserRole, overwrite: bool = False
+                                ) -> Tuple[int, List[str]]:
+        if user_role != UserRole.ADMIN:
+            return 0, ["仅管理员可导入映射方案"]
+
+        errors: List[str] = []
+        imported = 0
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                export_data = json.load(f)
+
+            schemes_data = export_data.get("schemes", [])
+            for sd in schemes_data:
+                new_scheme = ImportMappingScheme.from_dict(sd)
+                new_scheme.id = str(uuid.uuid4())
+                new_scheme.created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                new_scheme.updated_at = new_scheme.created_at
+                new_scheme.created_by = operator
+
+                existing = next((s for s in self.mapping_schemes if s.name == new_scheme.name and not s.is_revoked), None)
+                if existing:
+                    if overwrite:
+                        existing.column_mapping = new_scheme.column_mapping
+                        existing.datetime_format = new_scheme.datetime_format
+                        existing.date_format = new_scheme.date_format
+                        existing.time_format = new_scheme.time_format
+                        existing.updated_at = new_scheme.updated_at
+                        imported += 1
+                        self._add_operation_log(
+                            operation_type=OperationType.MAPPING_SCHEME_UPDATE.value,
+                            operator=operator,
+                            operator_role=user_role.value,
+                            description=f"导入覆盖映射方案：{existing.name}",
+                            detail=f"来源文件={filepath}",
+                        )
+                    else:
+                        errors.append(f"方案「{new_scheme.name}」已存在（跳过）")
+                else:
+                    self.mapping_schemes.append(new_scheme)
+                    imported += 1
+                    self._add_operation_log(
+                        operation_type=OperationType.MAPPING_SCHEME_CREATE.value,
+                        operator=operator,
+                        operator_role=user_role.value,
+                        description=f"导入新建映射方案：{new_scheme.name}",
+                        detail=f"来源文件={filepath}",
+                    )
+
+            self.save_mapping_schemes()
+        except Exception as e:
+            errors.append(f"导入失败：{str(e)}")
+
+        return imported, errors
+
+    def get_mapping_scheme(self, scheme_id: str) -> Optional[ImportMappingScheme]:
+        for s in self.mapping_schemes:
+            if s.id == scheme_id:
+                return s
+        return None
+
+    def list_mapping_schemes(self, include_revoked: bool = False) -> List[ImportMappingScheme]:
+        results = [s for s in self.mapping_schemes if include_revoked or not s.is_revoked]
+        results.sort(key=lambda s: s.updated_at, reverse=True)
+        return results
+
+    def set_last_mapping_scheme(self, scheme_id: str):
+        self.settings.mapping_import_session.last_scheme_id = scheme_id
+        self.save_settings()
+
+    def get_last_mapping_scheme(self) -> Optional[ImportMappingScheme]:
+        sid = self.settings.mapping_import_session.last_scheme_id
+        if not sid:
+            return None
+        return self.get_mapping_scheme(sid)
+
+    def set_last_mapping_file(self, filepath: str):
+        self.settings.mapping_import_session.last_file_path = filepath
+        self.save_settings()
+
+    def get_last_mapping_file(self) -> str:
+        return self.settings.mapping_import_session.last_file_path or ""
+
+    def save_last_precheck_result(self, result: PrecheckResult):
+        self.settings.mapping_import_session.last_precheck_result = result
+        self.save_settings()
+
+    def get_last_precheck_result(self) -> Optional[PrecheckResult]:
+        return self.settings.mapping_import_session.last_precheck_result
+
+    # ===== File Parsing (CSV / Excel) =====
+
+    def parse_import_file(self, filepath: str) -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], str]:
+        ext = os.path.splitext(filepath)[1].lower()
+        try:
+            if ext == ".csv":
+                return self._parse_csv_file(filepath)
+            elif ext in (".xlsx", ".xls"):
+                return self._parse_excel_file(filepath)
+            else:
+                return None, None, f"不支持的文件格式：{ext}，仅支持 .csv/.xlsx/.xls"
+        except Exception as e:
+            return None, None, f"文件读取失败：{str(e)}"
+
+    def _parse_csv_file(self, filepath: str) -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], str]:
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                headers = list(reader.fieldnames) if reader.fieldnames else []
+                if not headers:
+                    return None, None, "CSV文件无表头"
+                rows = []
+                for row in reader:
+                    cleaned = {}
+                    for h in headers:
+                        val = row.get(h, "")
+                        if val is None:
+                            val = ""
+                        cleaned[h] = str(val).strip()
+                    rows.append(cleaned)
+            return headers, rows, ""
+        except UnicodeDecodeError:
+            with open(filepath, "r", encoding="gbk") as f:
+                reader = csv.DictReader(f)
+                headers = list(reader.fieldnames) if reader.fieldnames else []
+                if not headers:
+                    return None, None, "CSV文件无表头"
+                rows = []
+                for row in reader:
+                    cleaned = {}
+                    for h in headers:
+                        val = row.get(h, "")
+                        if val is None:
+                            val = ""
+                        cleaned[h] = str(val).strip()
+                    rows.append(cleaned)
+            return headers, rows, ""
+
+    def _parse_excel_file(self, filepath: str) -> Tuple[Optional[List[str]], Optional[List[Dict[str, Any]]], str]:
+        try:
+            import openpyxl
+        except ImportError:
+            return None, None, "缺少 openpyxl 库，无法解析 Excel 文件。请执行：pip install openpyxl"
+
+        try:
+            wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+            ws = wb.active
+            rows_iter = ws.iter_rows(values_only=True)
+            headers_row = next(rows_iter, None)
+            if not headers_row:
+                wb.close()
+                return None, None, "Excel文件无数据"
+            headers = [str(h).strip() if h is not None else f"列{i+1}" for i, h in enumerate(headers_row)]
+            rows = []
+            for row_values in rows_iter:
+                row_dict = {}
+                for i, h in enumerate(headers):
+                    val = row_values[i] if i < len(row_values) else ""
+                    if val is None:
+                        val = ""
+                    if isinstance(val, datetime):
+                        if val.hour == 0 and val.minute == 0 and val.second == 0:
+                            row_dict[h] = val.strftime("%Y-%m-%d")
+                        else:
+                            row_dict[h] = val.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                        row_dict[h] = str(val).strip()
+                if any(v for v in row_dict.values()):
+                    rows.append(row_dict)
+            wb.close()
+            return headers, rows, ""
+        except Exception as e:
+            return None, None, f"Excel解析失败：{str(e)}"
+
+    def auto_match_columns(self, headers: List[str]) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        std_keywords = {
+            "instrument_code": ["仪器编号", "仪器号", "设备编号", "设备号", "仪器ID", "instrument", "code", "ins_code"],
+            "applicant": ["申请人", "使用人", "用户", "预约人", "申请人姓名", "applicant", "user"],
+            "reservation_date": ["日期", "预约日期", "使用日期", "date"],
+            "start_time": ["开始时间", "起始时间", "开始", "start", "start_time"],
+            "end_time": ["结束时间", "截止时间", "结束", "end", "end_time"],
+            "purpose": ["用途", "使用用途", "目的", "备注说明", "purpose"],
+        }
+        for std_key, keywords in std_keywords.items():
+            for h in headers:
+                hl = h.lower()
+                for kw in keywords:
+                    if kw.lower() in hl or hl == kw.lower():
+                        mapping[std_key] = h
+                        break
+                if std_key in mapping:
+                    break
+        return mapping
+
+    # ===== Precheck Module =====
+
+    def run_import_precheck(self, filepath: str, scheme: ImportMappingScheme
+                             ) -> Tuple[Optional[PrecheckResult], str]:
+        if not scheme:
+            return None, "映射方案为空"
+        if scheme.is_revoked:
+            return None, "不能使用已撤销的映射方案"
+
+        headers, rows, err = self.parse_import_file(filepath)
+        if err:
+            return None, err
+        if not rows:
+            return None, "文件无有效数据行"
+
+        mapping = scheme.column_mapping
+        issues: List[PrecheckIssue] = []
+        standard_rows: List[Dict[str, Any]] = []
+
+        required_std = ["instrument_code", "applicant", "start_time", "end_time", "purpose"]
+        missing_std = []
+        for std in required_std:
+            if std not in mapping or not mapping[std]:
+                missing_std.append(std)
+        has_date_col = "reservation_date" in mapping and mapping["reservation_date"]
+        missing_start_end_no_date = False
+        if not has_date_col and "reservation_date" not in missing_std:
+            pass
+
+        std_name_map = {k: v for k, v in STANDARD_COLUMNS}
+        for idx, row in enumerate(rows):
+            row_num = idx + 2
+            row_issues: List[PrecheckIssue] = []
+            std_row: Dict[str, Any] = {}
+            row_ok = True
+
+            for std_key, raw_col in mapping.items():
+                if not raw_col:
+                    continue
+                if raw_col not in row:
+                    row_issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="缺列",
+                        column_name=std_name_map.get(std_key, std_key),
+                        detail=f"原始列「{raw_col}」不存在于文件表头中",
+                        raw_row=row,
+                    ))
+                    row_ok = False
+                    continue
+                val = row.get(raw_col, "")
+                if std_key in required_std and not val:
+                    row_issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="空值",
+                        column_name=std_name_map.get(std_key, std_key),
+                        detail=f"列「{raw_col}」值为空",
+                        raw_row=row,
+                    ))
+                    row_ok = False
+                std_row[std_key] = val
+
+            if has_date_col and "reservation_date" in mapping and mapping["reservation_date"]:
+                date_val = row.get(mapping["reservation_date"], "")
+                start_val = std_row.get("start_time", "")
+                end_val = std_row.get("end_time", "")
+                if date_val and start_val and " " not in start_val:
+                    try:
+                        combined_start = f"{date_val} {start_val}"
+                        datetime.strptime(combined_start, f"{scheme.date_format} {scheme.time_format}")
+                        std_row["start_time"] = combined_start
+                    except ValueError:
+                        pass
+                if date_val and end_val and " " not in end_val:
+                    try:
+                        combined_end = f"{date_val} {end_val}"
+                        datetime.strptime(combined_end, f"{scheme.date_format} {scheme.time_format}")
+                        std_row["end_time"] = combined_end
+                    except ValueError:
+                        pass
+
+            start_str = std_row.get("start_time", "")
+            end_str = std_row.get("end_time", "")
+            start_dt = None
+            end_dt = None
+            if start_str:
+                parsed = False
+                for fmt in [scheme.datetime_format, "%Y-%m-%d %H:%M:%S", f"{scheme.date_format} {scheme.time_format}"]:
+                    try:
+                        start_dt = datetime.strptime(start_str, fmt)
+                        std_row["start_time"] = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        parsed = True
+                        break
+                    except (ValueError, TypeError):
+                        continue
+                if not parsed and start_dt is None:
+                    row_issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="时间格式错",
+                        column_name="开始时间",
+                        detail=f"「{start_str}」无法按格式解析（尝试了{scheme.datetime_format}等）",
+                        raw_row=row,
+                    ))
+                    row_ok = False
+
+            if end_str:
+                parsed = False
+                for fmt in [scheme.datetime_format, "%Y-%m-%d %H:%M:%S", f"{scheme.date_format} {scheme.time_format}"]:
+                    try:
+                        end_dt = datetime.strptime(end_str, fmt)
+                        std_row["end_time"] = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        parsed = True
+                        break
+                    except (ValueError, TypeError):
+                        continue
+                if not parsed and end_dt is None:
+                    row_issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="时间格式错",
+                        column_name="结束时间",
+                        detail=f"「{end_str}」无法按格式解析（尝试了{scheme.datetime_format}等）",
+                        raw_row=row,
+                    ))
+                    row_ok = False
+
+            if start_dt and end_dt and start_dt >= end_dt:
+                row_issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="时间逻辑错",
+                    column_name="结束时间",
+                    detail=f"开始时间「{std_row['start_time']}」不早于结束时间「{std_row['end_time']}」",
+                    raw_row=row,
+                ))
+                row_ok = False
+
+            ins_code = std_row.get("instrument_code", "")
+            if ins_code:
+                ins = self.get_instrument_by_code(ins_code)
+                if not ins:
+                    row_issues.append(PrecheckIssue(
+                        row_number=row_num,
+                        issue_type="仪器不存在",
+                        column_name="仪器编号",
+                        detail=f"仪器编号「{ins_code}」在系统中不存在",
+                        raw_row=row,
+                    ))
+                    row_ok = False
+
+            issues.extend(row_issues)
+            if row_ok:
+                standard_rows.append(std_row)
+
+        seen_keys = {}
+        duplicate_row_nums = set()
+        for i, srow in enumerate(standard_rows):
+            key = (srow.get("instrument_code", ""), srow.get("start_time", ""), srow.get("end_time", ""))
+            if key in seen_keys:
+                original_row = seen_keys[key]
+                duplicate_row_nums.add(i)
+                row_num = len(rows) + 2
+                for idx2, raw in enumerate(rows):
+                    match = True
+                    for std_k in ["instrument_code", "applicant"]:
+                        if std_k in mapping and mapping[std_k]:
+                            if raw.get(mapping[std_k], "") != srow.get(std_k, ""):
+                                match = False
+                                break
+                    if match and srow.get("start_time") and srow.get("end_time"):
+                        row_num = idx2 + 2
+                        break
+                issues.append(PrecheckIssue(
+                    row_number=row_num,
+                    issue_type="重复行",
+                    column_name="仪器+时间段",
+                    detail=f"与第{original_row}条数据重复（仪器相同、时间段相同）",
+                    raw_row=raw,
+                ))
+            else:
+                seen_keys[key] = i + 1
+
+        pass_rows = []
+        dup_indices = set()
+        seen_keys2 = {}
+        for i, srow in enumerate(standard_rows):
+            key = (srow.get("instrument_code", ""), srow.get("start_time", ""), srow.get("end_time", ""))
+            if key in seen_keys2:
+                dup_indices.add(i)
+            else:
+                seen_keys2[key] = True
+                pass_rows.append(srow)
+
+        result = PrecheckResult(
+            source_file=os.path.basename(filepath),
+            scheme_id=scheme.id,
+            scheme_name=scheme.name,
+            total_rows=len(rows),
+            pass_rows=len(pass_rows),
+            fail_rows=len(rows) - len(pass_rows),
+            issues=issues,
+            standard_rows=pass_rows,
+            timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+        self.settings.mapping_import_session.last_file_path = filepath
+        self.settings.mapping_import_session.last_scheme_id = scheme.id
+        self.settings.mapping_import_session.last_precheck_result = result
+        self.save_settings()
+
+        self._add_operation_log(
+            operation_type=OperationType.RESERVATION_IMPORT_PRECHECK.value,
+            operator=self.settings.current_user,
+            operator_role=self.settings.current_role.value,
+            description=f"预约导入预检：文件「{os.path.basename(filepath)}」，方案「{scheme.name}」",
+            detail=f"共{len(rows)}行，通过{len(pass_rows)}行，失败{len(rows)-len(pass_rows)}行，问题{len(issues)}条",
+        )
+
+        return result, ""
+
+    def export_precheck_failed_rows(self, precheck: PrecheckResult, filepath: str) -> Tuple[bool, str]:
+        try:
+            fail_by_row: Dict[int, List[PrecheckIssue]] = {}
+            for issue in precheck.issues:
+                if issue.row_number not in fail_by_row:
+                    fail_by_row[issue.row_number] = []
+                fail_by_row[issue.row_number].append(issue)
+
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(["行号", "问题类型", "关联列", "详细说明", "原始数据"])
+                for rn in sorted(fail_by_row.keys()):
+                    for issue in fail_by_row[rn]:
+                        raw_str = json.dumps(issue.raw_row, ensure_ascii=False) if issue.raw_row else ""
+                        writer.writerow([
+                            rn,
+                            issue.issue_type,
+                            issue.column_name,
+                            issue.detail,
+                            raw_str,
+                        ])
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    # ===== Execute Import to Drafts / Sandbox =====
+
+    def execute_import_to_drafts(self, precheck: PrecheckResult, operator: str,
+                                  user_role: UserRole) -> Tuple[int, List[str], List[str]]:
+        if not precheck or not precheck.standard_rows:
+            return 0, [], ["无可导入的数据"]
+        if precheck.fail_rows > 0:
+            return 0, [], ["存在未通过预检的行，必须全部通过后才能导入"]
+
+        created_ids: List[str] = []
+        errors: List[str] = []
+
+        batch_id = str(uuid.uuid4())
+        for idx, srow in enumerate(precheck.standard_rows):
+            ins = self.get_instrument_by_code(srow["instrument_code"])
+            if not ins:
+                errors.append(f"第{idx+1}行：仪器编号「{srow['instrument_code']}」不存在")
+                continue
+            res, msg = self.add_reservation(
+                instrument_id=ins.id,
+                applicant=srow["applicant"],
+                purpose=srow["purpose"],
+                start_time=srow["start_time"],
+                end_time=srow["end_time"],
+                batch_id=batch_id,
+            )
+            if res:
+                created_ids.append(res.id)
+            else:
+                errors.append(f"第{idx+1}行：{msg}")
+
+        self._add_operation_log(
+            operation_type=OperationType.RESERVATION_IMPORT_EXECUTE.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"预约导入执行：成功{len(created_ids)}条草稿，失败{len(errors)}条",
+            detail=f"来源文件={precheck.source_file}, 方案={precheck.scheme_name}, 批次ID={batch_id}",
+        )
+
+        return len(created_ids), created_ids, errors
+
+    def execute_import_to_sandbox(self, precheck: PrecheckResult, draft_name: str,
+                                   operator: str, user_role: UserRole
+                                   ) -> Tuple[Optional[SandboxDraft], List[str]]:
+        if user_role != UserRole.ADMIN:
+            return None, ["仅管理员可导入到沙盘"]
+        if not precheck or not precheck.standard_rows:
+            return None, ["无可导入的数据"]
+        if precheck.fail_rows > 0:
+            return None, ["存在未通过预检的行，必须全部通过后才能导入"]
+
+        items = []
+        for i, srow in enumerate(precheck.standard_rows):
+            items.append(SandboxDraftItem(
+                index=i,
+                instrument_code=srow["instrument_code"],
+                applicant=srow["applicant"],
+                purpose=srow["purpose"],
+                start_time=srow["start_time"],
+                end_time=srow["end_time"],
+            ))
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        draft = SandboxDraft(
+            id=str(uuid.uuid4()),
+            name=draft_name,
+            operator=operator,
+            operator_role=user_role.value,
+            items=items,
+            source_file=precheck.source_file,
+            created_at=now,
+            updated_at=now,
+        )
+        self.sandbox_drafts.insert(0, draft)
+        self.save_sandbox_drafts()
+
+        self._add_operation_log(
+            operation_type=OperationType.SANDBOX_IMPORT.value,
+            operator=operator,
+            operator_role=user_role.value,
+            description=f"映射导入沙盘：草稿「{draft_name}」，{len(items)}条记录",
+            detail=f"来源文件={precheck.source_file}, 方案={precheck.scheme_name}",
+        )
+
+        return draft, []
